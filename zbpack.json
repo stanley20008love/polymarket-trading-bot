@@ -1,0 +1,12 @@
+{
+  "build_command": "pip install -r requirements.txt",
+  "start_command": "python server.py",
+  "install": {
+    "commands": [
+      "pip install -r requirements.txt"
+    ]
+  },
+  "start": {
+    "command": "python server.py"
+  }
+}
