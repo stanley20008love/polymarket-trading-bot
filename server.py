@@ -272,7 +272,7 @@ def run_bot():
         # 尝试初始化 V3 模块
         try:
             from data_store import DataStore
-            data_store = DataStore(config)
+            data_store = DataStore()
             bot_status["v3_modules"]["data_store"] = "enabled"
             logger.info("V3 DataStore 初始化成功")
         except Exception as e:
@@ -291,8 +291,8 @@ def run_bot():
             bot_status["v3_modules"]["smart_money"] = f"error: {e}"
 
         try:
-            from orderbook_analyzer import OrderbookAnalyzer
-            orderbook = OrderbookAnalyzer(config)
+            from orderbook_analyzer import OrderBookAnalyzer
+            orderbook = OrderBookAnalyzer(config)
             bot_status["v3_modules"]["orderbook_analyzer"] = "enabled"
             logger.info("V3 OrderbookAnalyzer 初始化成功")
         except Exception as e:
