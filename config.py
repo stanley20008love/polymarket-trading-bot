@@ -102,6 +102,11 @@ class Config:
     COPY_TARGET_ADDRESS = os.getenv("COPY_TARGET_ADDRESS", "")
     COPY_TRADE_AMOUNT = float(os.getenv("COPY_TRADE_AMOUNT", "5"))
 
+    # Kelly Criterion V3
+    KELLY_FRACTION = float(os.getenv("KELLY_FRACTION", "0.25"))  # Quarter-Kelly，推荐0.25
+    ENABLE_SMART_MONEY = os.getenv("ENABLE_SMART_MONEY", "true").lower() == "true"
+    WS_ENABLED = os.getenv("WS_ENABLED", "false").lower() == "true"  # WebSocket默认关闭，需要websocket-client
+
     # 安全
     DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
 

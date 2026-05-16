@@ -58,7 +58,7 @@ class DataStore:
     def save_position_close(self, position, exit_price: float, pnl: float):
         try:
             pnl_pct = ((exit_price - position.entry_price) / position.entry_price * 100) if position.entry_price > 0 else 0
-            self.conn.execute("INSERT INTO position_history (market_id,question,side,entry_price,exit_price,amount,pnl,pnl_percent,hold_time_hours,strategy,signal_strength,entry_time,exit_time) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (position.market_id, position.question, position.side, position.entry_price, exit_price, position.amount, pnl, pnl_pct, position.hold_time_hours, position.strategy, position.signal_strength, position.entry_time, time.time()))
+            self.conn.execute("INSERT INTO position_history (market_id,question,side,entry_price,exit_price,amount,pnl,pnl_percent,hold_time_hours,strategy,signal_strength,entry_time,exit_time) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)", (position.market_id, position.question, position.side, position.entry_price, exit_price, position.amount, pnl, pnl_pct, (time.time() - position.entry_time) / 3600, getattr(position, 'strategy', ''), getattr(position, 'signal_strength', 0), position.entry_time, time.time()))
             self.conn.commit()
         except Exception as e:
             logger.warning(f"保存持仓记录失败: {e}")

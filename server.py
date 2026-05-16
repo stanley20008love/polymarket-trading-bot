@@ -42,6 +42,9 @@ bot_state = {
         "data_store": "disabled",
         "websocket": "disabled",
         "backtester": "disabled",
+        "probability_calibration": "disabled",
+        "dynamic_stop_loss": "disabled",
+        "portfolio_risk": "disabled",
     },
     "positions": [],
     "recent_trades": [],
@@ -408,6 +411,7 @@ function renderModules(modules) {
     zero_fee:'Zero Fee', multi_market_arb:'Multi-Market Arb',
     smart_money:'Smart Money', orderbook_analyzer:'OrderBook', kelly_sizing:'Kelly Sizing',
     data_store:'Data Store', websocket:'WebSocket', backtester:'Backtester',
+    probability_calibration:'Calibration', dynamic_stop_loss:'Dynamic SL', portfolio_risk:'Portfolio Risk',
   };
   function renderGrid(data, elId) {
     const el = document.getElementById(elId);
@@ -1008,6 +1012,10 @@ def run_bot():
         bot_state["v3_modules"]["smart_money"] = "enabled" if getattr(_config, 'ENABLE_SMART_MONEY', False) else "disabled"
         bot_state["v3_modules"]["kelly_sizing"] = "enabled" if getattr(_config, 'KELLY_FRACTION', 0) > 0 else "disabled"
         bot_state["v3_modules"]["websocket"] = "enabled" if getattr(_config, 'WS_ENABLED', False) else "disabled"
+        bot_state["v3_modules"]["backtester"] = "enabled" if _data_store else "disabled"
+        bot_state["v3_modules"]["probability_calibration"] = "enabled" if _data_store else "disabled"
+        bot_state["v3_modules"]["dynamic_stop_loss"] = "enabled"
+        bot_state["v3_modules"]["portfolio_risk"] = "enabled"
 
         # 初始化核心模块
         _scanner = MarketScanner(_config)
@@ -1133,10 +1141,20 @@ def run_bot():
                             _data_store.save_trade(record)
                         _risk_manager.remove_position(pos.market_id)
 
-                # 5. 处理交易机会
+                # 5. V3 OrderBook分析
+                if _orderbook and _executor and _executor.initialized:
+                    try:
+                        for pos in _risk_manager.positions[:5]:
+                            book = _executor.get_order_book(pos.token_id)
+                            if book:
+                                _orderbook.full_analysis(book, pos.token_id, pos.market_id, pos.question)
+                    except Exception as e:
+                        logger.debug(f"Orderbook分析失败: {e}")
+
+                # 6. 处理交易机会
                 # 套利
                 if _config.ENABLE_ARBITRAGE:
-                    for opp in opportunities.get("arbitrage", []):
+                    for opp in opportunities.get("single_arb", []):
                         m = opp["market"]
                         if opp["arb_spread"] * 100 < _config.ARB_MIN_SPREAD:
                             continue
@@ -1169,6 +1187,50 @@ def run_bot():
                                 question=m.question, side="YES+NO", action="BUY",
                                 price=m.total_price, amount=trade_amount * 2,
                                 strategy="ARBITRAGE",
+                            )
+                            _risk_manager.record_trade(record)
+                            if _data_store:
+                                _data_store.save_trade(record)
+
+                # 多市场套利
+                if getattr(_config, 'ENABLE_MULTI_MARKET_ARB', False):
+                    for opp in opportunities.get("multi_arb", []):
+                        markets = opp.get("markets", [])
+                        if not markets:
+                            continue
+                        direction = opp.get("direction", "")
+                        net_spread = opp.get("net_spread", 0)
+                        if net_spread <= 0:
+                            continue
+                        logger.info(f"多市场套利: {opp.get('event_title','')[:40]} 空间={net_spread*100:.2f}%")
+
+                # 0手续费策略
+                if getattr(_config, 'ENABLE_ZERO_FEE', False):
+                    for opp in opportunities.get("zero_fee", []):
+                        m = opp["market"]
+                        if any(p.market_id == m.id for p in _risk_manager.positions):
+                            continue
+                        trade_amount = _risk_manager.calculate_position_size(_config.INITIAL_CAPITAL)
+                        can, reason = _risk_manager.check_can_trade(trade_amount)
+                        if not can:
+                            continue
+                        side = opp["side"]
+                        price = opp["price"]
+                        logger.info(f"0手续费: {m.question[:40]} {side}@{price:.3f}")
+                        if _config.DRY_RUN:
+                            shares = trade_amount / price if price > 0 else 0
+                            pos = Position(
+                                market_id=m.id, question=m.question,
+                                token_id=m.yes_token_id if side == "YES" else m.no_token_id,
+                                side=side, entry_price=price, amount=shares,
+                                current_price=price,
+                            )
+                            _risk_manager.add_position(pos)
+                            record = TradeRecord(
+                                timestamp=time.time(), market_id=m.id,
+                                question=m.question, side=side, action="BUY",
+                                price=price, amount=trade_amount,
+                                strategy="ZERO_FEE_VALUE",
                             )
                             _risk_manager.record_trade(record)
                             if _data_store:
@@ -1243,7 +1305,7 @@ def run_bot():
                             if _data_store:
                                 _data_store.save_trade(record)
 
-                # 6. 更新全局状态
+                # 7. 更新全局状态
                 status = _risk_manager.get_status()
                 bot_state["positions_count"] = status["positions_count"]
                 bot_state["daily_pnl"] = status["daily_pnl"]
@@ -1262,7 +1324,7 @@ def run_bot():
                 if len(bot_state["pnl_history"]) > 200:
                     bot_state["pnl_history"] = bot_state["pnl_history"][-200:]
 
-                # 7. 保存状态
+                # 8. 保存状态
                 if scan_count % 10 == 0:
                     try:
                         with open(state_file, "w") as f:
