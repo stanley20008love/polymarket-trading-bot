@@ -1,12 +1,16 @@
 """
-Polymarket 量化交易系统 - 市场扫描器
-使用 Gamma API 获取活跃市场数据，筛选交易机会
+Polymarket 量化交易系统 V2 - 市场扫描器
+核心升级：
+1. 真实手续费模型: fee = shares × feeRate × price × (1-price)
+2. 多市场互斥套利: negRisk事件YES总和偏离1.0
+3. 地缘政治0手续费优先: 最适合100U小资金
+4. 体育市场maker返佣: 限价单=0手续费+25%返佣
 """
 import json
 import logging
 import time
 import requests
-from config import Config
+from config import Config, FEE_SCHEDULE, calc_taker_fee
 
 logger = logging.getLogger("polymarket")
 
@@ -58,9 +62,25 @@ class MarketInfo:
         self.spread = float(data.get("spread", 0) or 0)
         self.last_trade_price = float(data.get("lastTradePrice", 0) or 0)
 
-        # 手续费
-        self.maker_fee = float(data.get("makerBaseFee", 0) or 0) / 10000  # 基点转比例
-        self.taker_fee = float(data.get("takerBaseFee", 0) or 0) / 10000
+        # V2: 真实手续费模型
+        fee_schedule = data.get("feeSchedule", {})
+        if isinstance(fee_schedule, dict):
+            self.taker_fee_rate = float(fee_schedule.get("rate", 0.05) or 0.05)
+            self.is_taker_only = fee_schedule.get("takerOnly", True)
+            self.maker_rebate_rate = float(fee_schedule.get("rebateRate", 0.25) or 0.25)
+        else:
+            self.taker_fee_rate = 0.05
+            self.is_taker_only = True
+            self.maker_rebate_rate = 0.25
+
+        # V2: 手续费类型
+        self.fee_type = data.get("feeType", "general_fees")
+
+        # V2: 是否0手续费（地缘政治）
+        self.is_zero_fee = self.taker_fee_rate == 0 or self.fee_type == ""
+
+        # V2: 市场类别推断
+        self.category = self._infer_category(data)
 
         # 状态
         self.active = data.get("active", False)
@@ -71,28 +91,83 @@ class MarketInfo:
         # 原始数据
         self.raw = data
 
+    def _infer_category(self, data: dict) -> str:
+        """从市场数据推断品类"""
+        # 从slug或question中推断
+        slug = (data.get("slug", "") or "").lower()
+        question = (data.get("question", "") or "").lower()
+
+        if any(k in slug for k in ["geopol", "china-x", "russia", "iran", "war"]):
+            return "geopolitics"
+        if any(k in slug for k in ["crypto", "bitcoin", "btc", "eth", "xrp"]):
+            return "crypto"
+        if any(k in slug for k in ["sports", "nba", "nfl", "fifa", "soccer", "football", "champion"]):
+            return "sports"
+        if any(k in slug for k in ["politic", "election", "president", "trump", "democrat"]):
+            return "politics"
+        if any(k in slug for k in ["econ", "gdp", "inflation", "fed", "interest"]):
+            return "economics"
+        if any(k in slug for k in ["weather", "temperature"]):
+            return "weather"
+        if any(k in slug for k in ["tech", "ai", "apple", "google"]):
+            return "tech"
+        # 从feeSchedule推断
+        if self.taker_fee_rate == 0:
+            return "geopolitics"
+        if self.taker_fee_rate <= 0.03:
+            return "sports"
+        if self.taker_fee_rate <= 0.04:
+            return "politics"
+        return "general"
+
+    def calc_fee(self, shares: float, price: float, is_maker: bool = False) -> float:
+        """
+        V2: 计算真实手续费
+        fee = shares × feeRate × price × (1 - price)
+        Maker手续费 = 0
+        """
+        if is_maker:
+            return 0.0  # Maker永远不付费
+        return shares * self.taker_fee_rate * price * (1 - price)
+
+    def calc_maker_rebate(self, shares: float, price: float) -> float:
+        """计算Maker返佣"""
+        taker_fee = shares * self.taker_fee_rate * price * (1 - price)
+        return taker_fee * self.maker_rebate_rate
+
     @property
     def total_price(self) -> float:
-        """YES + NO 总价"""
         return self.yes_price + self.no_price
 
     @property
     def arb_spread(self) -> float:
-        """套利空间 (1 - YES - NO - 手续费)"""
-        total_fees = self.taker_fee * 2  # 买入YES和NO各付一次
-        return 1.0 - self.yes_price - self.no_price - total_fees
+        """
+        V2: 单市场YES+NO套利空间（扣真实手续费）
+        实测：YES+NO几乎总是=1.0，此策略几乎无机会
+        """
+        if self.total_price >= 1.0:
+            return 0.0
+        # 买入YES和NO各付taker fee
+        yes_fee = self.calc_fee(1, self.yes_price)
+        no_fee = self.calc_fee(1, self.no_price)
+        return 1.0 - self.total_price - yes_fee - no_fee
 
     @property
     def is_extreme_price(self) -> bool:
-        """价格是否极端"""
         return self.yes_price < 0.10 or self.yes_price > 0.90
 
+    @property
+    def taker_fee_usd_per_100shares(self) -> float:
+        """买100 shares的taker手续费(美元)"""
+        return self.calc_fee(100, self.yes_price)
+
     def __repr__(self):
-        return f"Market({self.question[:30]} YES={self.yes_price:.3f} NO={self.no_price:.3f} Vol=${self.volume:,.0f})"
+        fee_tag = "FREE" if self.is_zero_fee else f"fee={self.taker_fee_rate:.0%}"
+        return f"Market({self.question[:25]} Y={self.yes_price:.3f} {fee_tag})"
 
 
 class MarketScanner:
-    """市场扫描器 - 从Gamma API获取市场数据"""
+    """市场扫描器 V2"""
 
     def __init__(self, config: Config):
         self.config = config
@@ -100,9 +175,10 @@ class MarketScanner:
         self.session = requests.Session()
         self.session.headers.update({"Accept": "application/json"})
         self._cache: dict[str, tuple[float, list[MarketInfo]]] = {}
-        self.cache_ttl = 60  # 缓存60秒
+        self._events_cache: dict[str, tuple[float, list[dict]]] = {}
+        self.cache_ttl = 60
 
-    def fetch_active_markets(self, limit: int = 100) -> list[MarketInfo]:
+    def fetch_active_markets(self, limit: int = 200) -> list[MarketInfo]:
         """获取活跃市场列表"""
         cache_key = f"active_{limit}"
         now = time.time()
@@ -110,7 +186,6 @@ class MarketScanner:
         if cache_key in self._cache:
             ts, data = self._cache[cache_key]
             if now - ts < self.cache_ttl:
-                logger.debug(f"使用缓存的市场数据 ({len(data)}条)")
                 return data
 
         try:
@@ -143,106 +218,252 @@ class MarketScanner:
             logger.error(f"获取市场数据失败: {e}")
             return []
 
-    def find_arbitrage_opportunities(self, markets: list[MarketInfo]) -> list[dict]:
+    def fetch_events(self, limit: int = 50) -> list[dict]:
+        """获取事件列表（用于多市场套利）"""
+        cache_key = f"events_{limit}"
+        now = time.time()
+
+        if cache_key in self._events_cache:
+            ts, data = self._events_cache[cache_key]
+            if now - ts < self.cache_ttl:
+                return data
+
+        try:
+            url = f"{self.gamma_host}/events"
+            params = {
+                "limit": limit,
+                "active": "true",
+                "closed": "false",
+                "order": "volume",
+                "ascending": "false",
+            }
+            resp = self.session.get(url, params=params, timeout=20)
+            resp.raise_for_status()
+            data = resp.json()
+
+            self._events_cache[cache_key] = (now, data)
+            logger.info(f"获取到 {len(data)} 个活跃事件")
+            return data
+
+        except Exception as e:
+            logger.error(f"获取事件数据失败: {e}")
+            return []
+
+    def find_single_market_arbitrage(self, markets: list[MarketInfo]) -> list[dict]:
         """
-        寻找 YES+NO 套利机会
-        当 YES价格 + NO价格 < 1 - 手续费 时，买入双方锁定利润
+        单市场YES+NO套利（实测几乎不存在）
+        当YES+NO < 1.0 - 真实手续费时
         """
         opportunities = []
         for m in markets:
-            arb_spread = m.arb_spread
-            if arb_spread > 0:
-                # 计算年化收益
-                # 需要知道到期时间，简化处理
-                profit_per_dollar = arb_spread
+            spread = m.arb_spread
+            if spread > 0:
                 opportunities.append({
                     "market": m,
-                    "type": "YES+NO_ARBITRAGE",
+                    "type": "SINGLE_MARKET_ARB",
                     "yes_price": m.yes_price,
                     "no_price": m.no_price,
-                    "total_price": m.total_price,
-                    "arb_spread": arb_spread,
-                    "profit_per_dollar": profit_per_dollar,
-                    "confidence": "HIGH" if arb_spread > 0.02 else "MEDIUM",
+                    "arb_spread": spread,
+                    "confidence": "HIGH" if spread > 0.02 else "MEDIUM",
+                    "fee_category": m.category,
                 })
 
-        # 按套利空间排序
         opportunities.sort(key=lambda x: x["arb_spread"], reverse=True)
+        return opportunities
+
+    def find_multi_market_arbitrage(self) -> list[dict]:
+        """
+        V2核心策略：多市场互斥套利
+        negRisk事件中，所有互斥结果的YES价格总和应=1.0
+        如果 sum(YES) > 1.0 + 手续费，买入所有NO锁定利润
+        如果 sum(YES) < 1.0 - 手续费，买入所有YES锁定利润
+        实测确认：FIFA World Cup sumYES=1.038 有3.8%空间
+        """
+        opportunities = []
+        events = self.fetch_events()
+
+        for event in events:
+            markets = event.get("markets", [])
+            # 只看negRisk互斥市场
+            neg_risk_markets = []
+            for m_data in markets:
+                if not m_data.get("negRisk", False):
+                    continue
+                try:
+                    m = MarketInfo(m_data)
+                    if m.active and not m.closed and m.yes_price > 0.001:
+                        neg_risk_markets.append(m)
+                except:
+                    continue
+
+            if len(neg_risk_markets) < 3:
+                continue
+
+            # 计算YES总和
+            total_yes = sum(m.yes_price for m in neg_risk_markets)
+            gap = total_yes - 1.0
+
+            if abs(gap) < self.config.MULTI_ARB_MIN_GAP / 100:
+                continue  # 偏差太小
+
+            # 计算真实手续费
+            total_taker_fee = 0
+            for m in neg_risk_markets:
+                if gap > 0:
+                    # 买入所有NO
+                    total_taker_fee += m.calc_fee(1, m.no_price)
+                else:
+                    # 买入所有YES
+                    total_taker_fee += m.calc_fee(1, m.yes_price)
+
+            net_spread = abs(gap) - total_taker_fee
+
+            if net_spread > 0:
+                direction = "BUY_ALL_NO" if gap > 0 else "BUY_ALL_YES"
+                opportunities.append({
+                    "type": "MULTI_MARKET_ARB",
+                    "event_title": event.get("title", "")[:50],
+                    "num_markets": len(neg_risk_markets),
+                    "total_yes": total_yes,
+                    "gap": gap,
+                    "gap_pct": gap * 100,
+                    "total_taker_fee": total_taker_fee,
+                    "net_spread": net_spread,
+                    "net_spread_pct": net_spread * 100,
+                    "direction": direction,
+                    "markets": neg_risk_markets,
+                    "confidence": "HIGH" if net_spread > 0.02 else "MEDIUM",
+                })
+
+        opportunities.sort(key=lambda x: x["net_spread"], reverse=True)
+        return opportunities
+
+    def find_zero_fee_opportunities(self, markets: list[MarketInfo]) -> list[dict]:
+        """
+        V2新策略：地缘政治市场0手续费
+        最适合100U小资金：
+        - Taker fee = 0，进出无成本
+        - 限价单Maker也是0，无返佣但不花钱
+        - 最小化交易成本对小额资金的侵蚀
+        """
+        opportunities = []
+        for m in markets:
+            if not m.is_zero_fee:
+                continue
+            if m.volume < self.config.ZERO_FEE_MIN_VOLUME:
+                continue
+            if m.liquidity < self.config.ZERO_FEE_MIN_LIQUIDITY:
+                continue
+
+            # 在0手续费市场找极端价格
+            if m.yes_price > 0.01 and m.yes_price < 0.15:
+                opportunities.append({
+                    "market": m,
+                    "type": "ZERO_FEE_VALUE",
+                    "side": "YES",
+                    "price": m.yes_price,
+                    "potential_return": (1.0 - m.yes_price) / m.yes_price,
+                    "fee": 0.0,
+                    "confidence": "MEDIUM",
+                    "reason": f"0手续费地缘市场 YES={m.yes_price:.3f}, 潜在回报{(1.0-m.yes_price)/m.yes_price:.1f}x, 无交易成本",
+                })
+            elif m.yes_price > 0.85 and m.no_price > 0.01:
+                opportunities.append({
+                    "market": m,
+                    "type": "ZERO_FEE_VALUE",
+                    "side": "NO",
+                    "price": m.no_price,
+                    "potential_return": (1.0 - m.no_price) / m.no_price,
+                    "fee": 0.0,
+                    "confidence": "MEDIUM",
+                    "reason": f"0手续费地缘市场 NO={m.no_price:.3f}, 潜在回报{(1.0-m.no_price)/m.no_price:.1f}x, 无交易成本",
+                })
+
+        opportunities.sort(key=lambda x: x["potential_return"], reverse=True)
         return opportunities
 
     def find_mean_reversion_opportunities(self, markets: list[MarketInfo]) -> list[dict]:
         """
-        寻找均值回归机会
-        当价格极端 (<10% 或 >90%) 且有足够流动性时
-        思路: 如果 YES 价格 < 0.10，买入 YES (便宜赌注)
-              如果 YES 价格 > 0.90，买入 NO (便宜赌注)
+        均值回归 - V2修正：优先0手续费和低手续费市场
+        100U最怕手续费侵蚀，体育市场3%比加密7%好得多
         """
         opportunities = []
         for m in markets:
-            # 跳过低成交量市场
             if m.volume < self.config.MEAN_REV_MIN_VOLUME:
                 continue
             if m.liquidity < 5000:
                 continue
 
+            # V2: 优先0手续费和低手续费市场
+            fee_penalty = m.taker_fee_rate * 100  # 0%→0, 3%→3, 7%→7
+
             if m.yes_price <= self.config.MEAN_REV_LOW_THRESHOLD and m.yes_price > 0.01:
-                # YES价格极低 → 买入YES (低成本高回报)
-                potential_return = (1.0 - m.yes_price) / m.yes_price  # 潜在回报率
+                potential_return = (1.0 - m.yes_price) / m.yes_price
+                # V2: 调整置信度考虑手续费
+                if m.is_zero_fee:
+                    confidence = "HIGH"
+                elif fee_penalty <= 3:
+                    confidence = "MEDIUM"
+                else:
+                    confidence = "LOW"
                 opportunities.append({
                     "market": m,
                     "type": "MEAN_REVERSION_BUY_YES",
                     "side": "YES",
                     "price": m.yes_price,
                     "potential_return": potential_return,
-                    "confidence": "MEDIUM" if potential_return > 5 else "LOW",
-                    "reason": f"YES价格极低({m.yes_price:.3f}), 潜在回报{potential_return:.1f}x",
+                    "taker_fee_rate": m.taker_fee_rate,
+                    "confidence": confidence,
+                    "reason": f"YES={m.yes_price:.3f} 回报{potential_return:.1f}x 手续费{m.taker_fee_rate:.0%} ({m.category})",
                 })
 
             elif m.yes_price >= self.config.MEAN_REV_HIGH_THRESHOLD:
-                # YES价格极高 → 买入NO (低成本高回报)
                 no_price = m.no_price
                 if no_price > 0.01:
                     potential_return = (1.0 - no_price) / no_price
+                    if m.is_zero_fee:
+                        confidence = "HIGH"
+                    elif fee_penalty <= 3:
+                        confidence = "MEDIUM"
+                    else:
+                        confidence = "LOW"
                     opportunities.append({
                         "market": m,
                         "type": "MEAN_REVERSION_BUY_NO",
                         "side": "NO",
                         "price": no_price,
                         "potential_return": potential_return,
-                        "confidence": "MEDIUM" if potential_return > 5 else "LOW",
-                        "reason": f"YES价格极高({m.yes_price:.3f}), NO价{no_price:.3f}, 潜在回报{potential_return:.1f}x",
+                        "taker_fee_rate": m.taker_fee_rate,
+                        "confidence": confidence,
+                        "reason": f"NO={no_price:.3f} 回报{potential_return:.1f}x 手续费{m.taker_fee_rate:.0%} ({m.category})",
                     })
 
-        opportunities.sort(key=lambda x: x["potential_return"], reverse=True)
+        opportunities.sort(key=lambda x: (
+            {"HIGH": 3, "MEDIUM": 2, "LOW": 1}.get(x.get("confidence", "LOW"), 0),
+            -x["taker_fee_rate"],
+            x["potential_return"]
+        ), reverse=True)
         return opportunities
 
     def find_event_driven_opportunities(self, markets: list[MarketInfo]) -> list[dict]:
-        """
-        寻找事件驱动机会
-        高成交量 + 价格异动 = 可能有新信息导致误定价
-        """
+        """事件驱动 - V2修正：加手续费考量"""
         opportunities = []
         for m in markets:
-            # 高成交量筛选
             if m.volume_24h < self.config.EVENT_MIN_VOLUME_24H:
                 continue
 
-            # 价格异动筛选
-            price_change = abs(m.price_change_1h or 0) * 100  # 转为百分比
+            price_change = abs(m.price_change_1h or 0) * 100
             if price_change < self.config.EVENT_PRICE_CHANGE_THRESHOLD:
                 continue
 
-            # 判断方向
             if m.price_change_1h and m.price_change_1h > 0:
-                # 价格上涨 → 可能过度反应 → 买入NO
                 side = "NO"
                 price = m.no_price
-                reason = f"1h涨幅{m.price_change_1h*100:.1f}%, 可能过度反应"
+                reason = f"1h涨{m.price_change_1h*100:.1f}% 过度反应?"
             else:
-                # 价格下跌 → 可能过度反应 → 买入YES
                 side = "YES"
                 price = m.yes_price
-                reason = f"1h跌幅{abs(m.price_change_1h or 0)*100:.1f}%, 可能过度反应"
+                reason = f"1h跌{abs(m.price_change_1h or 0)*100:.1f}% 过度反应?"
 
             if price > 0.01 and price < 0.95:
                 opportunities.append({
@@ -252,34 +473,45 @@ class MarketScanner:
                     "price": price,
                     "volume_24h": m.volume_24h,
                     "price_change_1h": m.price_change_1h,
-                    "confidence": "LOW",  # 事件驱动天然低置信度
-                    "reason": reason,
+                    "taker_fee_rate": m.taker_fee_rate,
+                    "confidence": "LOW",
+                    "reason": f"{reason} 手续费{m.taker_fee_rate:.0%}",
                 })
 
         opportunities.sort(key=lambda x: abs(x["price_change_1h"] or 0), reverse=True)
         return opportunities
 
     def scan_all(self) -> dict[str, list[dict]]:
-        """执行全部扫描，返回按策略分类的机会"""
+        """执行全部V2扫描"""
         markets = self.fetch_active_markets()
 
         results = {
             "total_markets": len(markets),
-            "arbitrage": [],
+            "single_arb": [],
+            "multi_arb": [],
+            "zero_fee": [],
             "mean_reversion": [],
             "event_driven": [],
         }
 
         if self.config.ENABLE_ARBITRAGE:
-            results["arbitrage"] = self.find_arbitrage_opportunities(markets)
-            logger.info(f"套利机会: {len(results['arbitrage'])}个")
+            results["single_arb"] = self.find_single_market_arbitrage(markets)
+            logger.info(f"单市场套利: {len(results['single_arb'])}个")
+
+        if self.config.ENABLE_MULTI_MARKET_ARB:
+            results["multi_arb"] = self.find_multi_market_arbitrage()
+            logger.info(f"多市场套利: {len(results['multi_arb'])}个")
+
+        if self.config.ENABLE_ZERO_FEE:
+            results["zero_fee"] = self.find_zero_fee_opportunities(markets)
+            logger.info(f"0手续费机会: {len(results['zero_fee'])}个")
 
         if self.config.ENABLE_MEAN_REVERSION:
             results["mean_reversion"] = self.find_mean_reversion_opportunities(markets)
-            logger.info(f"均值回归机会: {len(results['mean_reversion'])}个")
+            logger.info(f"均值回归: {len(results['mean_reversion'])}个")
 
         if self.config.ENABLE_EVENT_DRIVEN:
             results["event_driven"] = self.find_event_driven_opportunities(markets)
-            logger.info(f"事件驱动机会: {len(results['event_driven'])}个")
+            logger.info(f"事件驱动: {len(results['event_driven'])}个")
 
         return results

@@ -116,14 +116,18 @@ class RiskManager:
 
         return True, "通过"
 
-    def calculate_position_size(self, capital: float) -> float:
-        """根据资金计算仓位大小"""
-        size = capital * (self.config.TRADE_SIZE_PERCENT / 100)
-        # 确保 >= 最小下单量
+    def calculate_position_size(self, capital: float, fee_rate: float = 0.05) -> float:
+        """
+        V2: 根据资金和手续费率计算仓位
+        100U下手续费占比高，需预留手续费空间
+        fee = shares × feeRate × price × (1-price)，price=0.5时最大
+        """
+        gross_size = capital * (self.config.TRADE_SIZE_PERCENT / 100)
+        # 预留手续费空间
+        max_fee_per_dollar = fee_rate * 0.25  # feeRate × 0.5 × 0.5
+        size = gross_size / (1 + max_fee_per_dollar)
         size = max(size, self.config.MIN_TRADE_SIZE)
-        # 确保 <= 20%资金 (安全上限)
-        size = min(size, capital * 0.20)
-        # 向下取整到0.01
+        size = min(size, capital * 0.15)  # V2: 更保守 20%→15%
         size = round(size, 2)
         return size
 
