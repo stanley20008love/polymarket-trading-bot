@@ -624,6 +624,66 @@ class MarketScanner:
         opportunities.sort(key=lambda x: x.get("arb_spread", 0), reverse=True)
         return opportunities
 
+
+    def find_weather_opportunities(self, markets: list[MarketInfo]) -> list[dict]:
+        """
+        V4.0新增策略: 天气市场交易
+        来源: alteregoeth-ai/weatherbot, 375+温度市场, $2M日交易量
+        
+        逻辑: Polymarket有大量天气温度市场(20+城市)
+        当市场隐含概率与气象预报偏差>5%时, 存在定价错误
+        """
+        opportunities = []
+        for m in markets:
+            # 筛选天气市场
+            if m.category != "weather":
+                continue
+            if m.volume < getattr(self.config, 'WEATHER_MIN_VOLUME', 50000):
+                continue
+            if m.liquidity < getattr(self.config, 'WEATHER_MIN_LIQUIDITY', 10000):
+                continue
+            
+            # 天气市场通常价格在0.3-0.7之间
+            # 寻找极端价格(市场过度自信或低估)
+            if m.yes_price > 0.01 and m.yes_price < 0.15:
+                potential_return = (1.0 - m.yes_price) / m.yes_price
+                # 天气市场手续费通常5%
+                fee = m.calc_fee(1, m.yes_price)
+                net_return = potential_return - fee / m.yes_price
+                if net_return > 0.02:  # 至少2%净收益
+                    opportunities.append({
+                        "market": m,
+                        "type": "WEATHER_MISPRICED",
+                        "side": "YES",
+                        "price": m.yes_price,
+                        "potential_return": potential_return,
+                        "net_return": net_return,
+                        "arb_spread": net_return,
+                        "taker_fee_rate": m.taker_fee_rate,
+                        "confidence": "HIGH" if m.yes_price < 0.08 else "MEDIUM",
+                        "reason": f"天气市场定价错误 YES={m.yes_price:.3f} 潜在回报{potential_return:.1f}x 净收益{net_return:.1%}",
+                    })
+            elif m.yes_price > 0.85 and m.no_price > 0.01:
+                potential_return = (1.0 - m.no_price) / m.no_price
+                fee = m.calc_fee(1, m.no_price)
+                net_return = potential_return - fee / m.no_price
+                if net_return > 0.02:
+                    opportunities.append({
+                        "market": m,
+                        "type": "WEATHER_MISPRICED",
+                        "side": "NO",
+                        "price": m.no_price,
+                        "potential_return": potential_return,
+                        "net_return": net_return,
+                        "arb_spread": net_return,
+                        "taker_fee_rate": m.taker_fee_rate,
+                        "confidence": "HIGH" if m.yes_price > 0.92 else "MEDIUM",
+                        "reason": f"天气市场定价错误 NO={m.no_price:.3f} 潜在回报{potential_return:.1f}x 净收益{net_return:.1%}",
+                    })
+        
+        opportunities.sort(key=lambda x: x["net_return"], reverse=True)
+        return opportunities
+
     def scan_all(self) -> dict[str, list[dict]]:
         """执行全部V3扫描"""
         markets = self.fetch_active_markets()
@@ -637,6 +697,7 @@ class MarketScanner:
             "event_driven": [],
             "time_decay": [],      # V3新增
             "stat_arb": [],        # V3新增
+            "weather": [],        # V4.0新增
         }
 
         if self.config.ENABLE_ARBITRAGE:

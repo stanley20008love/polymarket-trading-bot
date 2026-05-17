@@ -1,6 +1,6 @@
 """
-Polymarket 量化交易系统 V3.5 - 完整 REST API 服务器 + 专业前端仪表盘
-12步闭环数据流: WS→Scanner→SmartMoney→OrderBook→SignalCombiner→Kelly→Calibration→Risk→Execute→Record→Backtest→CalibrationFeedback
+Polymarket 量化交易系统 V4.0 - 完整 REST API 服务器 + 专业前端仪表盘
+14步闭环数据流: WS→Scanner→SmartMoney→OrderBook→WeatherData→SignalCombiner→Kelly→Calibration→Risk→Execute→Record→Backtest→CalibrationFeedback→StrategyWeightUpdate
 """
 import json
 import os
@@ -13,7 +13,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 # 全局共享状态 - bot主线程写入，API线程读取
 # ============================================================
 bot_state = {
-    "version": "3.5",
+    "version": "4.0",
     "status": "starting",
     "scan_count": 0,
     "positions_count": 0,
@@ -36,6 +36,9 @@ bot_state = {
         "multi_market_arb": "disabled",
         "time_decay": "disabled",
         "stat_arb": "disabled",
+        "weather": "disabled",
+        "dump_hedge": "disabled",
+        "counter_wallet": "disabled",
     },
     "v3_modules": {
         "smart_money": "disabled",
@@ -47,6 +50,8 @@ bot_state = {
         "probability_calibration": "disabled",
         "dynamic_stop_loss": "disabled",
         "portfolio_risk": "disabled",
+        "weather_fetcher": "disabled",
+        "calibration_feedback": "disabled",
     },
     "positions": [],
     "recent_trades": [],
@@ -56,7 +61,7 @@ bot_state = {
     "config": {},
     "data_store_stats": {},
     "strategy_performance": {},
-    # V3.5 新增状态
+    # V4.0 新增状态
     "kelly_state": {
         "last_fraction": 0.0,
         "last_raw_fraction": 0.0,
@@ -83,6 +88,22 @@ bot_state = {
         "confidence_adjustment": 0.7,
     },
     "backtest_results": {},
+    "weather_state": {
+        "cities_tracked": 0,
+        "last_fetch": "",
+        "markets_found": 0,
+        "noaa_aligned": 0,
+    },
+    "dump_hedge_state": {
+        "active_cycles": 0,
+        "hedge_triggered": 0,
+        "total_protected": 0.0,
+    },
+    "calibration_feedback_state": {
+        "last_weight_update": "",
+        "updates_applied": 0,
+        "weight_changes": [],
+    },
     "signal_combiner_state": {
         "last_combined_prob": 0.0,
         "last_signal_count": 0,
@@ -106,28 +127,31 @@ _portfolio_risk = None
 _backtester_v3 = None
 _ws_client = None
 
-# V3.5 策略权重(由校准反馈动态调整)
+# V4.0 策略权重 — 基于开源研究和学术论文(arXiv:2412.14144)调整
 # 修复: 根据学术研究调整初始权重 — 均值回归和统计套利是已验证的最有效策略
 _strategy_weights = {
-    "ARBITRAGE": 0.15,        # 降低: 41%市场存在但窗口仅2.7s，零售难以捕获
-    "MEAN_REVERSION": 0.30,   # 提高: ResearchGate论文验证可盈利，尤其大波动后
-    "EVENT_DRIVEN": 0.15,     # 中等: 需要放宽极端价格限制
-    "ZERO_FEE_VALUE": 0.10,   # 中等: 0手续费市场是真实优势
-    "STOP_LOSS_TP": 0.05,     # 低: 这是风控不是策略
-    "TIME_DECAY": 0.15,       # 新增: 临近结算市场的确定性收益
-    "STAT_ARB": 0.10,         # 新增: 统计套利(spread_fade + momentum)
+    "ARBITRAGE": 0.08,         # V4降低: 41%市场存在但窗口仅2.7s，零售难以捕获(tradesignal.se)
+    "MEAN_REVERSION": 0.20,    # V4降低: ResearchGate验证可盈利，但100U小资金手续费侵蚀严重
+    "EVENT_DRIVEN": 0.10,      # V4降低: 需要放宽极端价格限制，反转信号不准
+    "ZERO_FEE_VALUE": 0.12,    # V4提高: 0手续费地缘政治市场是小资金最大优势
+    "STOP_LOSS_TP": 0.03,      # 风控不是策略
+    "TIME_DECAY": 0.15,        # 保持: 临近结算市场的确定性收益(medium.com/illumination)
+    "STAT_ARB": 0.10,          # 保持: spread_fade + momentum
+    "WEATHER": 0.15,           # V4新增: 天气市场$2M日交易量, NOAA数据对齐(alteregoeth-ai/weatherbot)
+    "DUMP_HEDGE": 0.05,        # V4新增: 15min BTC市场对冲策略(Bird-eye-pp/polymarket-arbitrage-trading-bot)
+    "COUNTER_WALLET": 0.02,    # V4新增: 反向跟单亏损钱包(Reddit社区验证)
 }
 
 
 # ============================================================
-# 专业前端仪表盘 HTML (V3.5 增强版)
+# 专业前端仪表盘 HTML (V4.0 增强版)
 # ============================================================
 DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Polymarket V3.5 Quant Dashboard</title>
+<title>Polymarket V4.0 Quant Dashboard</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 :root{
@@ -247,8 +271,8 @@ tr:hover td{background:rgba(59,130,246,.03)}
 <!-- Header -->
 <div class="header">
   <div class="header-left">
-    <div class="logo">Polymarket V3.5</div>
-    <span class="version" id="version">v3.5</span>
+    <div class="logo">Polymarket V4.0</div>
+    <span class="version" id="version">v4.0</span>
     <div id="statusBadge" class="status-badge status-starting">
       <span class="status-dot"></span>
       <span id="statusText">Starting</span>
@@ -315,14 +339,14 @@ tr:hover td{background:rgba(59,130,246,.03)}
       </div>
     </div>
     <div class="card">
-      <div class="card-header"><span class="card-title">&#9881; V3 Modules</span></div>
+      <div class="card-header"><span class="card-title">&#9881; V4 Modules</span></div>
       <div class="card-body">
         <div class="module-grid" id="modulesGrid"></div>
       </div>
     </div>
   </div>
 
-  <!-- V3.5 Advanced Metrics Row -->
+  <!-- V4.0 Advanced Metrics Row -->
   <div class="grid-4" style="margin-bottom:24px">
     <!-- Kelly & Position Sizing -->
     <div class="card">
@@ -481,7 +505,7 @@ function renderKPIs(d) {
   document.getElementById('kpiLastScan').textContent = d.last_scan||'-';
   document.getElementById('scanCount').textContent = d.scan_count||0;
   document.getElementById('uptime').textContent = fmtUptime(d.uptime||0);
-  document.getElementById('version').textContent = 'v' + (d.version||'3.5');
+  document.getElementById('version').textContent = 'v' + (d.version||'4.0');
   // Status
   const badge = document.getElementById('statusBadge');
   badge.className = 'status-badge status-' + (d.status||'starting');
@@ -508,10 +532,11 @@ function renderKPIs(d) {
 function renderModules(modules) {
   const nameMap = {
     arbitrage:'Arbitrage', mean_reversion:'Mean Reversion', event_driven:'Event Driven',
-    zero_fee:'Zero Fee', multi_market_arb:'Multi-Market Arb',
+    zero_fee:'Zero Fee', multi_market_arb:'Multi-Market Arb', weather:'Weather', dump_hedge:'Dump Hedge', counter_wallet:'Counter Wallet',
     smart_money:'Smart Money', orderbook_analyzer:'OrderBook', kelly_sizing:'Kelly Sizing',
     data_store:'Data Store', websocket:'WebSocket', backtester:'Backtester',
     probability_calibration:'Calibration', dynamic_stop_loss:'Dynamic SL', portfolio_risk:'Portfolio Risk',
+    weather_fetcher:'Weather', calibration_feedback:'Cal Feedback',
   };
   function renderGrid(data, elId) {
     const el = document.getElementById(elId);
@@ -660,7 +685,7 @@ function renderDataStore(data) {
   el.innerHTML = html;
 }
 
-// ============ V3.5 Advanced Metric Renders ============
+// ============ V4.0 Advanced Metric Renders ============
 function renderKelly(data) {
   const el = document.getElementById('kellyBody');
   if (!data || !Object.keys(data).length) { el.innerHTML = '<div class="empty-state" style="padding:20px">No Kelly data</div>'; return; }
@@ -953,7 +978,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     "entry_time": p.entry_time,
                     "hold_time_hours": round((time.time() - p.entry_time) / 3600, 1),
                 }
-                # V3.5: 附加Kelly元数据
+                # V4.0: 附加Kelly元数据
                 if hasattr(p, '_signal_prob'):
                     pos_data["signal_prob"] = round(p._signal_prob, 4)
                 if hasattr(p, '_kelly_fraction'):
@@ -1109,7 +1134,7 @@ class APIHandler(BaseHTTPRequestHandler):
             "note": "Opportunities are generated in real-time by the bot loop",
         })
 
-    # ---------- V3.5 新增 API 端点 ----------
+    # ---------- V4.0 新增 API 端点 ----------
 
     def _kelly(self):
         """Kelly仓位参数和最近计算结果"""
@@ -1240,7 +1265,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 "kelly_cap": getattr(_config, 'KELLY_FRACTION', 0.25) if _config else 0.25,
             }
         stats["kelly_fraction"] = getattr(_config, 'KELLY_FRACTION', 0.25) if _config else 0.25
-        # V3.5: 附加信号合并器状态
+        # V4.0: 附加信号合并器状态
         stats["signal_combiner"] = bot_state.get("signal_combiner_state", {})
         stats["strategy_weights"] = _strategy_weights
         self._send_json(200, stats)
@@ -1400,7 +1425,7 @@ def run_bot():
             _orderbook = None
             bot_state["v3_modules"]["orderbook_analyzer"] = "error"
 
-        # ===== V3.5 五大模块初始化 =====
+        # ===== V4.0 六大模块初始化 =====
         # 模块一: Kelly Criterion仓位管理
         try:
             from kelly_criterion import kellyBinary, combinedKelly, confidenceAdjustedKelly, calculate_position_size_kelly
@@ -1413,9 +1438,9 @@ def run_bot():
             kelly_frac = getattr(_config, 'KELLY_FRACTION', 0.25)
             bot_state["v3_modules"]["kelly_sizing"] = "enabled" if kelly_frac > 0 else "disabled"
             bot_state["kelly_state"]["kelly_cap"] = kelly_frac
-            logger.info(f"V3.5 Kelly Criterion 初始化成功 (fraction={kelly_frac})")
+            logger.info(f"V4.0 Kelly Criterion 初始化成功 (fraction={kelly_frac})")
         except Exception as e:
-            logger.warning(f"V3.5 Kelly Criterion 初始化失败: {e}")
+            logger.warning(f"V4.0 Kelly Criterion 初始化失败: {e}")
             _kelly = None
             bot_state["v3_modules"]["kelly_sizing"] = "error"
 
@@ -1915,7 +1940,7 @@ def run_bot():
                             amount=shares,
                             current_price=trade_price,
                         )
-                        # V3.5: 附加Kelly元数据到Position
+                        # V4.0: 附加Kelly元数据到Position
                         pos._signal_prob = signals[0]["probability"] if signals else 0.5
                         pos._kelly_fraction = kelly_fraction
                         pos._highest_price = trade_price

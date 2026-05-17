@@ -1,7 +1,7 @@
 """
-Polymarket 量化交易系统 V2 - 配置管理
-基于对250万钱包真实数据分析的升级版
-关键修正：手续费模型、风控参数、策略优先级
+Polymarket 量化交易系统 V4.0 - 配置管理
+基于开源研究(github.com/cobra0xbear, alteregoeth-ai/weatherbot)和学术论文(arXiv:2412.14144)
+V4.0新增: 天气市场策略、对冲策略、反向跟单、校准反馈闭环
 """
 import os
 from dotenv import load_dotenv
@@ -103,10 +103,26 @@ class Config:
     COPY_TARGET_ADDRESS = os.getenv("COPY_TARGET_ADDRESS", "")
     COPY_TRADE_AMOUNT = float(os.getenv("COPY_TRADE_AMOUNT", "5"))
 
-    # Kelly Criterion V3
+    # V4.0 天气市场策略
+    ENABLE_WEATHER = os.getenv("ENABLE_WEATHER", "true").lower() == "true"
+    WEATHER_MIN_VOLUME = float(os.getenv("WEATHER_MIN_VOLUME", "50000"))
+    WEATHER_MIN_LIQUIDITY = float(os.getenv("WEATHER_MIN_LIQUIDITY", "10000"))
+    WEATHER_CITIES = os.getenv("WEATHER_CITIES", "new-york,los-angeles,chicago")  # NOAA城市
+
+    # V4.0 对冲策略 (15min BTC市场)
+    ENABLE_DUMP_HEDGE = os.getenv("ENABLE_DUMP_HEDGE", "true").lower() == "true"
+    DUMP_HEDGE_MAX_CYCLE_MINUTES = int(os.getenv("DUMP_HEDGE_MAX_CYCLE_MINUTES", "15"))
+    DUMP_HEDGE_HEDGE_THRESHOLD = float(os.getenv("DUMP_HEDGE_HEDGE_THRESHOLD", "0.02"))  # 2%不利时对冲
+
+    # V4.0 反向跟单
+    ENABLE_COUNTER_WALLET = os.getenv("ENABLE_COUNTER_WALLET", "false").lower() == "true"
+    COUNTER_WALLET_MIN_LOSS_RATE = float(os.getenv("COUNTER_WALLET_MIN_LOSS_RATE", "0.7"))  # 胜率<30%的反向
+
+    # Kelly Criterion V4.0 — 基于arXiv:2412.14144论文调整
+    # Quarter-Kelly (0.25) 是社区共识，Full-Kelly在预测市场有33%概率腰斩
     KELLY_FRACTION = float(os.getenv("KELLY_FRACTION", "0.25"))  # Quarter-Kelly，推荐0.25
     ENABLE_SMART_MONEY = os.getenv("ENABLE_SMART_MONEY", "true").lower() == "true"
-    WS_ENABLED = os.getenv("WS_ENABLED", "true").lower() == "true"  # V3.5: WebSocket默认开启，自动降级REST轮询
+    WS_ENABLED = os.getenv("WS_ENABLED", "true").lower() == "true"  # V4.0: WebSocket默认开启，自动降级REST轮询
 
     # 安全
     DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"
@@ -117,7 +133,7 @@ class Config:
     TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
     # 运行
-    SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "15"))  # V3: 20s→15s 更快捕捉
+    SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "10"))  # V4.0: 15s→10s 更快捕捉套利窗口
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
     # API端点
