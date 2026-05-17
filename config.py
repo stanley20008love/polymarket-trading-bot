@@ -105,7 +105,7 @@ class Config:
     # Kelly Criterion V3
     KELLY_FRACTION = float(os.getenv("KELLY_FRACTION", "0.25"))  # Quarter-Kelly，推荐0.25
     ENABLE_SMART_MONEY = os.getenv("ENABLE_SMART_MONEY", "true").lower() == "true"
-    WS_ENABLED = os.getenv("WS_ENABLED", "false").lower() == "true"  # WebSocket默认关闭，需要websocket-client
+    WS_ENABLED = os.getenv("WS_ENABLED", "true").lower() == "true"  # V3.5: WebSocket默认开启，自动降级REST轮询
 
     # 安全
     DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"

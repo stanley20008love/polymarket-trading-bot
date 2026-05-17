@@ -1,6 +1,6 @@
 """
-Polymarket 量化交易系统 V3 - 完整 REST API 服务器 + 专业前端仪表盘
-提供前端仪表盘所需的全部数据端点
+Polymarket 量化交易系统 V3.5 - 完整 REST API 服务器 + 专业前端仪表盘
+12步闭环数据流: WS→Scanner→SmartMoney→OrderBook→SignalCombiner→Kelly→Calibration→Risk→Execute→Record→Backtest→CalibrationFeedback
 """
 import json
 import os
@@ -54,6 +54,38 @@ bot_state = {
     "config": {},
     "data_store_stats": {},
     "strategy_performance": {},
+    # V3.5 新增状态
+    "kelly_state": {
+        "last_fraction": 0.0,
+        "last_raw_fraction": 0.0,
+        "last_edge": 0.0,
+        "last_confidence": 0.0,
+        "last_adjusted": False,
+        "last_reason": "",
+        "kelly_cap": 0.25,
+        "last_position_size": 0.0,
+    },
+    "risk_advanced": {
+        "var95": 0.0,
+        "cvar95": 0.0,
+        "max_drawdown_pct": 0.0,
+        "portfolio_heat": 0.0,
+        "adjusted_exposure": 0.0,
+    },
+    "calibration_state": {
+        "brier_score": 0.25,
+        "ece": 0.1,
+        "bss": 0.0,
+        "reliability": 0.0,
+        "sample_size": 0,
+        "confidence_adjustment": 0.7,
+    },
+    "backtest_results": {},
+    "signal_combiner_state": {
+        "last_combined_prob": 0.0,
+        "last_signal_count": 0,
+        "last_disagreement": 0.0,
+    },
 }
 
 # 全局模块引用（由 run_bot 设置）
@@ -72,16 +104,25 @@ _portfolio_risk = None
 _backtester_v3 = None
 _ws_client = None
 
+# V3.5 策略权重(由校准反馈动态调整)
+_strategy_weights = {
+    "ARBITRAGE": 0.3,
+    "MEAN_REVERSION": 0.25,
+    "EVENT_DRIVEN": 0.2,
+    "ZERO_FEE_VALUE": 0.15,
+    "STOP_LOSS_TP": 0.1,
+}
+
 
 # ============================================================
-# 专业前端仪表盘 HTML
+# 专业前端仪表盘 HTML (V3.5 增强版)
 # ============================================================
 DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Polymarket V3 Quant Dashboard</title>
+<title>Polymarket V3.5 Quant Dashboard</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 :root{
@@ -89,7 +130,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
   --border:#2a3040;--text-primary:#e2e8f0;--text-secondary:#94a3b8;--text-muted:#64748b;
   --accent:#3b82f6;--accent-hover:#2563eb;--green:#10b981;--green-bg:rgba(16,185,129,.1);
   --red:#ef4444;--red-bg:rgba(239,68,68,.1);--yellow:#f59e0b;--yellow-bg:rgba(245,158,11,.1);
-  --purple:#8b5cf6;--cyan:#06b6d4;
+  --purple:#8b5cf6;--cyan:#06b6d4;--orange:#f97316;--orange-bg:rgba(249,115,22,.1);
 }
 body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:var(--bg-primary);color:var(--text-primary);min-height:100vh}
 .header{background:linear-gradient(135deg,#0f172a 0%,#1e1b4b 50%,#0f172a 100%);border-bottom:1px solid var(--border);padding:16px 24px;display:flex;align-items:center;justify-content:space-between;position:sticky;top:0;z-index:100}
@@ -125,7 +166,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;b
 .section-count{font-size:12px;background:rgba(59,130,246,.15);color:var(--accent);padding:2px 8px;border-radius:10px}
 .grid-2{display:grid;grid-template-columns:1fr 1fr;gap:20px}
 .grid-3{display:grid;grid-template-columns:1fr 1fr 1fr;gap:20px}
-@media(max-width:1024px){.grid-2,.grid-3{grid-template-columns:1fr}}
+.grid-4{display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:20px}
+@media(max-width:1024px){.grid-2,.grid-3,.grid-4{grid-template-columns:1fr}}
 .card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;overflow:hidden}
 .card-header{padding:14px 18px;border-bottom:1px solid var(--border);display:flex;align-items:center;justify-content:space-between}
 .card-title{font-size:14px;font-weight:600}
@@ -141,6 +183,7 @@ tr:hover td{background:rgba(59,130,246,.03)}
 .tag-blue{background:rgba(59,130,246,.15);color:var(--accent)}
 .tag-purple{background:rgba(139,92,246,.15);color:var(--purple)}
 .tag-cyan{background:rgba(6,182,212,.15);color:var(--cyan)}
+.tag-orange{background:var(--orange-bg);color:var(--orange)}
 .module-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:10px}
 .module-item{display:flex;align-items:center;justify-content:space-between;padding:10px 14px;background:var(--bg-secondary);border-radius:8px;border:1px solid var(--border)}
 .module-name{font-size:13px;font-weight:500}
@@ -181,14 +224,26 @@ tr:hover td{background:rgba(59,130,246,.03)}
 .scrollable::-webkit-scrollbar{width:4px}
 .scrollable::-webkit-scrollbar-track{background:var(--bg-secondary)}
 .scrollable::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px}
+.metric-row{display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid rgba(42,48,64,.3)}
+.metric-label{color:var(--text-secondary);font-size:13px}
+.metric-value{font-size:13px;font-weight:700}
+.metric-value-positive{color:var(--green)}
+.metric-value-negative{color:var(--red)}
+.metric-value-neutral{color:var(--cyan)}
+.data-flow-step{display:flex;align-items:center;gap:10px;padding:6px 0;font-size:12px}
+.step-num{width:22px;height:22px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:10px;flex-shrink:0}
+.step-active{background:var(--green-bg);color:var(--green)}
+.step-idle{background:rgba(100,116,139,.1);color:var(--text-muted)}
+.step-label{color:var(--text-secondary);flex:1}
+.step-arrow{color:var(--text-muted);font-size:10px}
 </style>
 </head>
 <body>
 <!-- Header -->
 <div class="header">
   <div class="header-left">
-    <div class="logo">Polymarket V3</div>
-    <span class="version" id="version">v3.2</span>
+    <div class="logo">Polymarket V3.5</div>
+    <span class="version" id="version">v3.5</span>
     <div id="statusBadge" class="status-badge status-starting">
       <span class="status-dot"></span>
       <span id="statusText">Starting</span>
@@ -258,6 +313,38 @@ tr:hover td{background:rgba(59,130,246,.03)}
       <div class="card-header"><span class="card-title">&#9881; V3 Modules</span></div>
       <div class="card-body">
         <div class="module-grid" id="modulesGrid"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- V3.5 Advanced Metrics Row -->
+  <div class="grid-4" style="margin-bottom:24px">
+    <!-- Kelly & Position Sizing -->
+    <div class="card">
+      <div class="card-header"><span class="card-title">&#128202; Kelly & Position Sizing</span></div>
+      <div class="card-body" id="kellyBody">
+        <div class="empty-state" style="padding:20px">Loading...</div>
+      </div>
+    </div>
+    <!-- Risk Metrics -->
+    <div class="card">
+      <div class="card-header"><span class="card-title">&#9888; Risk Metrics</span></div>
+      <div class="card-body" id="riskAdvBody">
+        <div class="empty-state" style="padding:20px">Loading...</div>
+      </div>
+    </div>
+    <!-- Calibration Metrics -->
+    <div class="card">
+      <div class="card-header"><span class="card-title">&#127919; Calibration</span></div>
+      <div class="card-body" id="calibrationBody">
+        <div class="empty-state" style="padding:20px">Loading...</div>
+      </div>
+    </div>
+    <!-- Backtest Results -->
+    <div class="card">
+      <div class="card-header"><span class="card-title">&#128196; Backtest</span></div>
+      <div class="card-body scrollable" id="backtestBody" style="max-height:280px">
+        <div class="empty-state" style="padding:20px">No backtest data</div>
       </div>
     </div>
   </div>
@@ -364,6 +451,7 @@ function fmtMoney(v, showSign=true) {
   return s + '$' + Math.abs(v).toFixed(2);
 }
 function fmtPct(v) { return (v >= 0 ? '+' : '') + v.toFixed(2) + '%'; }
+function fmtPctRaw(v) { return (v*100).toFixed(2) + '%'; }
 function fmtUptime(s) {
   const h = Math.floor(s/3600), m = Math.floor((s%3600)/60), sec = s%60;
   return h + ':' + String(m).padStart(2,'0') + ':' + String(sec).padStart(2,'0');
@@ -388,7 +476,7 @@ function renderKPIs(d) {
   document.getElementById('kpiLastScan').textContent = d.last_scan||'-';
   document.getElementById('scanCount').textContent = d.scan_count||0;
   document.getElementById('uptime').textContent = fmtUptime(d.uptime||0);
-  document.getElementById('version').textContent = 'v' + (d.version||'3.2');
+  document.getElementById('version').textContent = 'v' + (d.version||'3.5');
   // Status
   const badge = document.getElementById('statusBadge');
   badge.className = 'status-badge status-' + (d.status||'starting');
@@ -567,6 +655,79 @@ function renderDataStore(data) {
   el.innerHTML = html;
 }
 
+// ============ V3.5 Advanced Metric Renders ============
+function renderKelly(data) {
+  const el = document.getElementById('kellyBody');
+  if (!data || !Object.keys(data).length) { el.innerHTML = '<div class="empty-state" style="padding:20px">No Kelly data</div>'; return; }
+  const frac = data.last_fraction||0;
+  const fracCls = frac >= 0.1 ? 'metric-value-positive' : frac > 0 ? 'metric-value-neutral' : 'metric-value-negative';
+  let html = '';
+  html += '<div class="metric-row"><span class="metric-label">Kelly Fraction</span><span class="metric-value '+fracCls+'">'+(frac*100).toFixed(2)+'%</span></div>';
+  html += '<div class="metric-row"><span class="metric-label">Raw Fraction</span><span class="metric-value">'+((data.last_raw_fraction||0)*100).toFixed(2)+'%</span></div>';
+  html += '<div class="metric-row"><span class="metric-label">Edge</span><span class="metric-value '+(data.last_edge>=0?'metric-value-positive':'metric-value-negative')+'">'+((data.last_edge||0)*100).toFixed(2)+'%</span></div>';
+  html += '<div class="metric-row"><span class="metric-label">Confidence</span><span class="metric-value">'+((data.last_confidence||0)*100).toFixed(1)+'%</span></div>';
+  html += '<div class="metric-row"><span class="metric-label">Kelly Cap</span><span class="metric-value">'+((data.kelly_cap||0.25)*100).toFixed(0)+'%</span></div>';
+  html += '<div class="metric-row"><span class="metric-label">Position Size</span><span class="metric-value">$'+(data.last_position_size||0).toFixed(2)+'</span></div>';
+  html += '<div style="margin-top:6px;font-size:11px;color:var(--text-muted)">'+escHtml(data.last_reason||'')+'</div>';
+  el.innerHTML = html;
+}
+
+function renderRiskAdvanced(data) {
+  const el = document.getElementById('riskAdvBody');
+  if (!data || !Object.keys(data).length) { el.innerHTML = '<div class="empty-state" style="padding:20px">No risk data</div>'; return; }
+  const varCls = data.var95 > 2 ? 'metric-value-negative' : 'metric-value-positive';
+  const ddCls = data.max_drawdown_pct > 10 ? 'metric-value-negative' : data.max_drawdown_pct > 5 ? 'metric-value-neutral' : 'metric-value-positive';
+  const heatCls = data.portfolio_heat > 0.5 ? 'metric-value-negative' : data.portfolio_heat > 0.2 ? 'metric-value-neutral' : 'metric-value-positive';
+  let html = '';
+  html += '<div class="metric-row"><span class="metric-label">VaR 95%</span><span class="metric-value '+varCls+'">$'+(data.var95||0).toFixed(2)+'</span></div>';
+  html += '<div class="metric-row"><span class="metric-label">CVaR 95%</span><span class="metric-value">$'+(data.cvar95||0).toFixed(2)+'</span></div>';
+  html += '<div class="metric-row"><span class="metric-label">Max Drawdown</span><span class="metric-value '+ddCls+'">'+(data.max_drawdown_pct||0).toFixed(1)+'%</span></div>';
+  html += '<div class="metric-row"><span class="metric-label">Portfolio Heat</span><span class="metric-value '+heatCls+'">'+((data.portfolio_heat||0)*100).toFixed(1)+'%</span></div>';
+  html += '<div class="metric-row"><span class="metric-label">Adj. Exposure</span><span class="metric-value">$'+(data.adjusted_exposure||0).toFixed(2)+'</span></div>';
+  el.innerHTML = html;
+}
+
+function renderCalibration(data) {
+  const el = document.getElementById('calibrationBody');
+  if (!data || !Object.keys(data).length) { el.innerHTML = '<div class="empty-state" style="padding:20px">No calibration data</div>'; return; }
+  const m = data.overall_metrics || data;
+  const bs = m.brier_score ?? 0.25;
+  const ece = m.ece ?? 0.1;
+  const bss = m.brier_skill_score ?? 0;
+  const rel = m.reliability ?? 0;
+  const ss = m.sample_size ?? 0;
+  const ca = data.confidence_adjustment ?? 0.7;
+  const bsCls = bs < 0.15 ? 'metric-value-positive' : bs < 0.25 ? 'metric-value-neutral' : 'metric-value-negative';
+  const eceCls = ece < 0.05 ? 'metric-value-positive' : ece < 0.1 ? 'metric-value-neutral' : 'metric-value-negative';
+  const bssCls = bss > 0.2 ? 'metric-value-positive' : bss > 0 ? 'metric-value-neutral' : 'metric-value-negative';
+  let html = '';
+  html += '<div class="metric-row"><span class="metric-label">Brier Score</span><span class="metric-value '+bsCls+'">'+bs.toFixed(4)+'</span></div>';
+  html += '<div class="metric-row"><span class="metric-label">ECE</span><span class="metric-value '+eceCls+'">'+ece.toFixed(4)+'</span></div>';
+  html += '<div class="metric-row"><span class="metric-label">BSS</span><span class="metric-value '+bssCls+'">'+bss.toFixed(4)+'</span></div>';
+  html += '<div class="metric-row"><span class="metric-label">Reliability</span><span class="metric-value">'+(rel*100).toFixed(1)+'%</span></div>';
+  html += '<div class="metric-row"><span class="metric-label">Samples</span><span class="metric-value">'+ss+'</span></div>';
+  html += '<div class="metric-row"><span class="metric-label">Conf. Factor</span><span class="metric-value '+(ca>=1?'metric-value-positive':ca>=0.7?'metric-value-neutral':'metric-value-negative')+'">'+ca.toFixed(2)+'</span></div>';
+  el.innerHTML = html;
+}
+
+function renderBacktest(data) {
+  const el = document.getElementById('backtestBody');
+  const results = data.results || {};
+  if (!Object.keys(results).length) { el.innerHTML = '<div class="empty-state" style="padding:20px">No backtest data</div>'; return; }
+  let html = '<table><tr><th>Strategy</th><th>Win%</th><th>PnL</th><th>Sharpe</th><th>MDD</th></tr>';
+  Object.entries(results).forEach(([name, r]) => {
+    const wrCls = (r.win_rate||0)>=0.5?'tag-green':'tag-red';
+    const pnlCls = (r.total_pnl||0)>=0?'tag-green':'tag-red';
+    html += '<tr><td><span class="tag tag-cyan">'+escHtml(name)+'</span></td>';
+    html += '<td><span class="tag '+wrCls+'">'+((r.win_rate||0)*100).toFixed(0)+'%</span></td>';
+    html += '<td><span class="tag '+pnlCls+'">$'+(r.total_pnl||0).toFixed(2)+'</span></td>';
+    html += '<td>'+(r.sharpe_ratio||0).toFixed(2)+'</td>';
+    html += '<td>'+(r.max_drawdown||0).toFixed(1)+'%</td></tr>';
+  });
+  html += '</table>';
+  el.innerHTML = html;
+}
+
 // ============ PnL Chart ============
 function drawPnLChart(history) {
   const canvas = document.getElementById('pnlCanvas');
@@ -650,7 +811,7 @@ function escHtml(s) { const d = document.createElement('div'); d.textContent = s
 
 // ============ Main Refresh ============
 async function refreshAll() {
-  const [dashboard, positions, trades, smartMoney, orderbook, pnlHist, modules, perf, config, dsStats] = await Promise.all([
+  const [dashboard, positions, trades, smartMoney, orderbook, pnlHist, modules, perf, config, dsStats, kelly, riskAdv, calibration, backtest] = await Promise.all([
     api('/api/dashboard'),
     api('/api/positions'),
     api('/api/trades'),
@@ -661,6 +822,10 @@ async function refreshAll() {
     api('/api/strategy-performance'),
     api('/api/config'),
     api('/api/data-store/stats'),
+    api('/api/kelly'),
+    api('/api/risk-advanced'),
+    api('/api/calibration'),
+    api('/api/backtest'),
   ]);
   if (dashboard) renderKPIs(dashboard);
   if (positions) renderPositions(positions);
@@ -672,6 +837,10 @@ async function refreshAll() {
   if (perf) renderPerformance(perf);
   if (config) renderConfig(config);
   if (dsStats) renderDataStore(dsStats);
+  if (kelly) renderKelly(kelly);
+  if (riskAdv) renderRiskAdvanced(riskAdv);
+  if (calibration) renderCalibration(calibration);
+  if (backtest) renderBacktest(backtest);
 }
 
 // Start
@@ -715,6 +884,9 @@ class APIHandler(BaseHTTPRequestHandler):
             "/api/calibration": self._calibration,
             "/api/backtest": self._backtest,
             "/api/v3-modules-stats": self._v3_modules_stats,
+            # V3.5 新增端点
+            "/api/kelly": self._kelly,
+            "/api/risk-advanced": self._risk_advanced,
         }
         handler = routes.get(path)
         if handler:
@@ -760,7 +932,7 @@ class APIHandler(BaseHTTPRequestHandler):
         if _risk_manager:
             positions = []
             for p in _risk_manager.positions:
-                positions.append({
+                pos_data = {
                     "market_id": p.market_id,
                     "question": p.question,
                     "token_id": p.token_id,
@@ -775,7 +947,15 @@ class APIHandler(BaseHTTPRequestHandler):
                     "take_profit": round(p.take_profit, 4),
                     "entry_time": p.entry_time,
                     "hold_time_hours": round((time.time() - p.entry_time) / 3600, 1),
-                })
+                }
+                # V3.5: 附加Kelly元数据
+                if hasattr(p, '_signal_prob'):
+                    pos_data["signal_prob"] = round(p._signal_prob, 4)
+                if hasattr(p, '_kelly_fraction'):
+                    pos_data["kelly_fraction"] = round(p._kelly_fraction, 4)
+                if hasattr(p, '_highest_price'):
+                    pos_data["highest_price"] = round(p._highest_price, 4)
+                positions.append(pos_data)
             bot_state["positions"] = positions
         self._send_json(200, {
             "count": len(positions),
@@ -885,7 +1065,8 @@ class APIHandler(BaseHTTPRequestHandler):
                 "ENABLE_MEAN_REVERSION": _config.ENABLE_MEAN_REVERSION,
                 "ENABLE_EVENT_DRIVEN": _config.ENABLE_EVENT_DRIVEN,
                 "ENABLE_SMART_MONEY": getattr(_config, 'ENABLE_SMART_MONEY', False),
-                "KELLY_FRACTION": getattr(_config, 'KELLY_FRACTION', 0),
+                "KELLY_FRACTION": getattr(_config, 'KELLY_FRACTION', 0.25),
+                "WS_ENABLED": getattr(_config, 'WS_ENABLED', True),
                 "CLOB_HOST": _config.CLOB_HOST,
             }
         self._send_json(200, bot_state.get("config", {}))
@@ -923,51 +1104,140 @@ class APIHandler(BaseHTTPRequestHandler):
             "note": "Opportunities are generated in real-time by the bot loop",
         })
 
+    # ---------- V3.5 新增 API 端点 ----------
+
+    def _kelly(self):
+        """Kelly仓位参数和最近计算结果"""
+        result = dict(bot_state.get("kelly_state", {}))
+        if _kelly:
+            result["kelly_cap"] = getattr(_config, 'KELLY_FRACTION', 0.25) if _config else 0.25
+            result["module_enabled"] = True
+        else:
+            result["module_enabled"] = False
+        self._send_json(200, result)
+
+    def _risk_advanced(self):
+        """高级风险指标: VaR/CVaR/回撤/热度"""
+        result = dict(bot_state.get("risk_advanced", {}))
+        if _portfolio_risk:
+            try:
+                # 实时计算
+                from risk_manager_v3 import PositionInfo
+                positions = []
+                if _risk_manager:
+                    for p in _risk_manager.positions:
+                        positions.append(PositionInfo(
+                            market_id=p.market_id,
+                            question=p.question,
+                            side=p.side,
+                            entry_price=p.entry_price,
+                            current_price=p.current_price,
+                            amount=p.amount,
+                            pnl=p.pnl,
+                        ))
+                result["var95"] = round(_portfolio_risk.compute_var(positions, 0.95), 4)
+                result["cvar95"] = round(_portfolio_risk.compute_cvar(positions, 0.95), 4)
+                result["max_drawdown_pct"] = round(_portfolio_risk.compute_max_drawdown(), 2)
+                result["portfolio_heat"] = round(_portfolio_risk.get_portfolio_heat(positions), 4)
+                result["adjusted_exposure"] = round(_portfolio_risk.get_correlation_adjusted_exposure(positions), 2)
+                bot_state["risk_advanced"] = result
+            except Exception:
+                pass
+        self._send_json(200, result)
+
     def _calibration(self):
-        """概率校准数据"""
+        """概率校准数据 - 增强版"""
         if _calibration:
-            stats = _calibration.get_stats()
-            metrics = _calibration.get_metrics()
-            return self._send_json(200, {
-                "stats": stats,
-                "overall_metrics": {
+            try:
+                stats = _calibration.get_stats()
+                metrics = _calibration.get_metrics()
+                conf_adj = _calibration.get_confidence_adjustment()
+                result = {
+                    "stats": stats,
+                    "overall_metrics": {
+                        "brier_score": metrics.brier_score,
+                        "ece": metrics.ece,
+                        "brier_skill_score": metrics.brier_skill_score,
+                        "reliability": metrics.reliability,
+                        "sample_size": metrics.sample_size,
+                    },
+                    "confidence_adjustment": conf_adj,
+                    "calibration_curve": metrics.calibration_curve[:10] if metrics.calibration_curve else [],
+                }
+                # 更新 bot_state
+                bot_state["calibration_state"] = {
                     "brier_score": metrics.brier_score,
                     "ece": metrics.ece,
-                    "brier_skill_score": metrics.brier_skill_score,
+                    "bss": metrics.brier_skill_score,
                     "reliability": metrics.reliability,
                     "sample_size": metrics.sample_size,
-                },
-                "confidence_adjustment": _calibration.get_confidence_adjustment(),
-            })
-        self._send_json(200, {"stats": {}, "overall_metrics": {}, "confidence_adjustment": 1.0})
+                    "confidence_adjustment": conf_adj,
+                }
+                return self._send_json(200, result)
+            except Exception as e:
+                return self._send_json(200, {
+                    "stats": {}, "overall_metrics": {},
+                    "confidence_adjustment": 0.7, "error": str(e),
+                })
+        self._send_json(200, {"stats": {}, "overall_metrics": {}, "confidence_adjustment": 0.7})
 
     def _backtest(self):
-        """回测数据"""
+        """回测数据 - 增强版：实际运行回测"""
         if _backtester_v3 and _data_store:
             try:
+                capital = _config.INITIAL_CAPITAL if _config else 100
+                kelly_frac = getattr(_config, 'KELLY_FRACTION', 0.25) if _config else 0.25
                 results = _backtester_v3.compare_strategies(
-                    capital=_config.INITIAL_CAPITAL if _config else 100,
+                    capital=capital,
                     days=30
                 )
-                return self._send_json(200, {"results": results})
+                bot_state["backtest_results"] = results
+                return self._send_json(200, {
+                    "results": results,
+                    "kelly_fraction": kelly_frac,
+                    "capital": capital,
+                })
             except Exception as e:
-                return self._send_json(200, {"results": {}, "error": str(e)})
-        self._send_json(200, {"results": {}})
+                return self._send_json(200, {"results": bot_state.get("backtest_results", {}), "error": str(e)})
+        self._send_json(200, {"results": bot_state.get("backtest_results", {})})
 
     def _v3_modules_stats(self):
-        """V3.5模块统计"""
+        """V3.5模块统计 - 增强版"""
         stats = {}
         if _dynamic_stop:
-            stats["dynamic_stop_loss"] = _dynamic_stop.get_stats()
+            try:
+                stats["dynamic_stop_loss"] = _dynamic_stop.get_stats()
+            except Exception:
+                stats["dynamic_stop_loss"] = {"error": "failed"}
         if _portfolio_risk:
-            stats["portfolio_risk"] = _portfolio_risk.get_stats()
+            try:
+                stats["portfolio_risk"] = _portfolio_risk.get_stats()
+            except Exception:
+                stats["portfolio_risk"] = {"error": "failed"}
         if _orderbook_engine:
-            stats["orderbook_engine"] = _orderbook_engine.get_stats()
+            try:
+                stats["orderbook_engine"] = _orderbook_engine.get_stats()
+            except Exception:
+                stats["orderbook_engine"] = {"error": "failed"}
         if _ws_client:
-            stats["websocket_client"] = _ws_client.get_status()
+            try:
+                stats["websocket_client"] = _ws_client.get_status()
+            except Exception:
+                stats["websocket_client"] = {"error": "failed"}
         if _calibration:
-            stats["calibration"] = _calibration.get_stats()
+            try:
+                stats["calibration"] = _calibration.get_stats()
+            except Exception:
+                stats["calibration"] = {"error": "failed"}
+        if _kelly:
+            stats["kelly_criterion"] = {
+                "enabled": True,
+                "kelly_cap": getattr(_config, 'KELLY_FRACTION', 0.25) if _config else 0.25,
+            }
         stats["kelly_fraction"] = getattr(_config, 'KELLY_FRACTION', 0.25) if _config else 0.25
+        # V3.5: 附加信号合并器状态
+        stats["signal_combiner"] = bot_state.get("signal_combiner_state", {})
+        stats["strategy_weights"] = _strategy_weights
         self._send_json(200, stats)
 
     def _dashboard_summary(self):
@@ -996,6 +1266,11 @@ class APIHandler(BaseHTTPRequestHandler):
             _risk_manager.reset_circuit_breaker()
             bot_state["circuit_breaker"] = False
             bot_state["circuit_breaker_reason"] = ""
+            if _portfolio_risk:
+                try:
+                    _portfolio_risk.reset_circuit_breaker()
+                except Exception:
+                    pass
             self._send_json(200, {"ok": True, "message": "Circuit breaker reset"})
         else:
             self._send_json(400, {"error": "Risk manager not initialized"})
@@ -1036,12 +1311,27 @@ def start_api_server(port=8000):
 
 
 # ============================================================
-# Bot 主循环
+# Bot 主循环 - 12步闭环数据流
 # ============================================================
 def run_bot():
-    """在后台线程中运行交易机器人"""
+    """
+    12步闭环数据流:
+    Step 1:  WebSocket → OrderbookEngine (实时订单簿)
+    Step 2:  REST Scanner → MarketScanner (交易机会)
+    Step 3:  Smart Money Tracker → 信号
+    Step 4:  OrderBookAnalyzer → 信号
+    Step 5:  Signal Combiner → 综合概率估计
+    Step 6:  Kelly Criterion → 仓位计算
+    Step 7:  Calibration adjustment → 置信度因子
+    Step 8:  Risk Manager → 最终检查 (动态SL + 组合风险 + 基本检查)
+    Step 9:  执行交易
+    Step 10: 记录交易 + 喂入校准
+    Step 11: 定期回测
+    Step 12: 校准反馈 → 调整策略权重
+    """
     global _risk_manager, _smart_money, _orderbook, _data_store, _executor, _scanner, _config
     global _kelly, _orderbook_engine, _calibration, _dynamic_stop, _portfolio_risk, _backtester_v3, _ws_client
+    global _strategy_weights
 
     import logging
     import sys
@@ -1083,7 +1373,7 @@ def run_bot():
         except Exception as e:
             logger.warning(f"V3 DataStore 初始化失败: {e}")
             _data_store = None
-            bot_state["v3_modules"]["data_store"] = f"error"
+            bot_state["v3_modules"]["data_store"] = "error"
 
         try:
             from smart_money_tracker import SmartMoneyTracker
@@ -1093,7 +1383,7 @@ def run_bot():
         except Exception as e:
             logger.warning(f"V3 SmartMoneyTracker 初始化失败: {e}")
             _smart_money = None
-            bot_state["v3_modules"]["smart_money"] = f"error"
+            bot_state["v3_modules"]["smart_money"] = "error"
 
         try:
             from orderbook_analyzer import OrderBookAnalyzer
@@ -1103,7 +1393,7 @@ def run_bot():
         except Exception as e:
             logger.warning(f"V3 OrderbookAnalyzer 初始化失败: {e}")
             _orderbook = None
-            bot_state["v3_modules"]["orderbook_analyzer"] = f"error"
+            bot_state["v3_modules"]["orderbook_analyzer"] = "error"
 
         # ===== V3.5 五大模块初始化 =====
         # 模块一: Kelly Criterion仓位管理
@@ -1117,24 +1407,27 @@ def run_bot():
             }
             kelly_frac = getattr(_config, 'KELLY_FRACTION', 0.25)
             bot_state["v3_modules"]["kelly_sizing"] = "enabled" if kelly_frac > 0 else "disabled"
+            bot_state["kelly_state"]["kelly_cap"] = kelly_frac
             logger.info(f"V3.5 Kelly Criterion 初始化成功 (fraction={kelly_frac})")
         except Exception as e:
             logger.warning(f"V3.5 Kelly Criterion 初始化失败: {e}")
             _kelly = None
             bot_state["v3_modules"]["kelly_sizing"] = "error"
 
-        # 模块二: WebSocket + OrderbookEngine
+        # 模块二: WebSocket + OrderbookEngine (始终创建，WS开启时自动连，否则REST轮询降级)
         try:
             from orderbook_engine import ResilientWebSocket, OrderbookEngine
             _orderbook_engine = OrderbookEngine(max_snapshots=100, stale_seconds=60)
-            ws_enabled = getattr(_config, 'WS_ENABLED', False)
-            if ws_enabled:
-                _ws_client = ResilientWebSocket(_config)
-                _ws_client.on("orderbook_update", lambda d: _orderbook_engine.update_book(
-                    d.get("token_id", ""), d.get("bids", []), d.get("asks", [])))
-                _ws_client.start()
-            bot_state["v3_modules"]["websocket"] = "enabled" if ws_enabled else "disabled"
-            logger.info(f"V3.5 OrderbookEngine 初始化成功 (WS={'ON' if ws_enabled else 'OFF'})")
+            # V3.5 修复: 始终创建 ResilientWebSocket，它内部会自动降级到REST轮询
+            _ws_client = ResilientWebSocket(_config)
+            _ws_client.on("orderbook_update", lambda d: _orderbook_engine.update_book(
+                d.get("token_id", ""), d.get("bids", []), d.get("asks", [])))
+            _ws_client.on("price_change", lambda d: _dynamic_stop and _dynamic_stop.update_price(
+                d.get("token_id", ""), d.get("price", 0)) if _dynamic_stop else None)
+            _ws_client.start()
+            ws_enabled = getattr(_config, 'WS_ENABLED', True)
+            bot_state["v3_modules"]["websocket"] = "enabled"
+            logger.info(f"V3.5 OrderbookEngine + WebSocket 初始化成功 (WS={'ON' if ws_enabled else 'REST fallback'})")
         except Exception as e:
             logger.warning(f"V3.5 OrderbookEngine 初始化失败: {e}")
             _orderbook_engine = None
@@ -1201,13 +1494,13 @@ def run_bot():
         scan_count = 0
 
         mode = "模拟" if _config.DRY_RUN else "实盘"
-        logger.info(f"V3 交易系统启动 [{mode}] ${_config.INITIAL_CAPITAL}")
+        logger.info(f"V3.5 交易系统启动 [{mode}] ${_config.INITIAL_CAPITAL} - 12步闭环数据流")
         try:
-            _notifier.system_alert(f"V3 交易系统启动 [{mode}] ${_config.INITIAL_CAPITAL}")
+            _notifier.system_alert(f"V3.5 交易系统启动 [{mode}] ${_config.INITIAL_CAPITAL}")
         except Exception:
             pass
 
-        # 主循环
+        # ===== 12步闭环主循环 =====
         while True:
             try:
                 scan_count += 1
@@ -1218,37 +1511,129 @@ def run_bot():
                 bot_state["circuit_breaker"] = _risk_manager.circuit_breaker
                 bot_state["circuit_breaker_reason"] = _risk_manager.circuit_breaker_reason
 
-                logger.info(f"--- 扫描周期 #{scan_count} ---")
+                logger.info(f"--- 扫描周期 #{scan_count} (12步闭环) ---")
 
-                # 1. 扫描市场
+                # ===== Step 1: WebSocket → OrderbookEngine (实时订单簿) =====
+                try:
+                    if _orderbook_engine:
+                        _orderbook_engine.cleanup_stale()
+                        # 为已有持仓的token订阅实时数据
+                        for pos in _risk_manager.positions[:10]:
+                            if pos.token_id and _ws_client:
+                                _ws_client.subscribe_market(pos.token_id)
+                        logger.info(f"Step1: OrderbookEngine tracking {_orderbook_engine.get_stats().get('tracked_tokens', 0)} tokens")
+                except Exception as e:
+                    logger.debug(f"Step1 OrderbookEngine 异常: {e}")
+
+                # ===== Step 2: REST Scanner → MarketScanner (交易机会) =====
                 opportunities = _scanner.scan_all()
+                logger.info(f"Step2: Scanner found {sum(len(v) for v in opportunities.values() if isinstance(v, list))} opportunities")
 
-                # 2. V3 Smart Money 分析
-                if _smart_money and getattr(_config, 'ENABLE_SMART_MONEY', False):
-                    try:
+                # ===== Step 3: Smart Money Tracker → 信号 =====
+                smart_signals_by_market = {}  # market_id → signal dict
+                try:
+                    if _smart_money and getattr(_config, 'ENABLE_SMART_MONEY', True):
                         smart_signals = _smart_money.scan_smart_money([])
                         if smart_signals:
-                            logger.info(f"Smart Money: {len(smart_signals)} signals")
+                            logger.info(f"Step3: Smart Money: {len(smart_signals)} signals")
                             if _data_store:
                                 for sig in smart_signals:
                                     _data_store.save_smart_signal(sig)
-                    except Exception as e:
-                        logger.warning(f"Smart Money 分析失败: {e}")
+                            # 按 market_id 索引
+                            for sig in smart_signals:
+                                if sig.market_id:
+                                    smart_signals_by_market[sig.market_id] = {
+                                        "direction": sig.direction,
+                                        "strength": sig.strength,
+                                        "confidence": sig.confidence,
+                                        "kelly_edge": sig.kelly_edge,
+                                        "signal_type": sig.signal_type,
+                                    }
+                except Exception as e:
+                    logger.warning(f"Step3 Smart Money 分析失败: {e}")
 
-                # 3. 更新持仓价格
+                # ===== Step 4: OrderBookAnalyzer → 信号 =====
+                ob_signals_by_market = {}  # market_id → signal dict
+                try:
+                    if _orderbook and _executor and _executor.initialized:
+                        for pos in _risk_manager.positions[:5]:
+                            book = _executor.get_order_book(pos.token_id)
+                            if book:
+                                _orderbook.full_analysis(book, pos.token_id, pos.market_id, pos.question)
+                        # 也分析新机会
+                        for opp_type in ["mean_reversion", "event_driven", "zero_fee"]:
+                            for opp in opportunities.get(opp_type, [])[:3]:
+                                m = opp.get("market")
+                                if m and hasattr(m, 'yes_token_id'):
+                                    book = _executor.get_order_book(m.yes_token_id)
+                                    if book:
+                                        _orderbook.full_analysis(book, m.yes_token_id, m.id, m.question)
+                        # 收集信号
+                        for sig in _orderbook.signals[:20]:
+                            if sig.market_id:
+                                ob_signals_by_market[sig.market_id] = {
+                                    "direction": sig.direction,
+                                    "strength": sig.strength,
+                                    "signal_type": sig.signal_type,
+                                }
+                        logger.info(f"Step4: OrderbookAnalyzer: {len(ob_signals_by_market)} market signals")
+                except Exception as e:
+                    logger.debug(f"Step4 Orderbook分析失败: {e}")
+
+                # ===== Step 5: 更新持仓价格 (为动态止损准备) =====
                 for pos in _risk_manager.positions:
                     try:
-                        mid = _executor.get_midpoint(pos.token_id)
+                        # 优先使用WebSocket实时价格
+                        mid = None
+                        if _orderbook_engine:
+                            mid = _orderbook_engine.get_mid_price(pos.token_id)
+                        if mid is None or mid <= 0:
+                            mid = _executor.get_midpoint(pos.token_id)
                         if mid and mid > 0:
                             pos.current_price = mid
+                            # 更新动态止损的价格历史
+                            if _dynamic_stop:
+                                _dynamic_stop.update_price(pos.token_id, mid)
+                            # 更新最高价(用于移动止损)
+                            if not hasattr(pos, '_highest_price'):
+                                pos._highest_price = mid
+                            pos._highest_price = max(pos._highest_price, mid)
                     except Exception:
                         pass
 
-                # 4. 检查止损止盈
-                to_close = _risk_manager.check_stop_loss_take_profit()
+                # ===== Step 6: 检查止损止盈 (使用动态止损 V3) =====
+                to_close = []
+                try:
+                    # 优先使用V3动态止损
+                    if _dynamic_stop:
+                        for pos in _risk_manager.positions:
+                            highest = getattr(pos, '_highest_price', pos.current_price)
+                            sl_result = _dynamic_stop.check_stop_loss(
+                                entry_price=pos.entry_price,
+                                current_price=pos.current_price,
+                                token_id=pos.token_id,
+                                entry_time=pos.entry_time,
+                                highest_price=highest,
+                                side=pos.side,
+                            )
+                            if sl_result.should_stop:
+                                to_close.append((pos, sl_result.reason))
+                                logger.info(f"Step6 V3止损: {pos.question[:40]} | {sl_result.stop_type}: {sl_result.reason}")
+                    # 也使用基本止损止盈检查(兜底)
+                    basic_close = _risk_manager.check_stop_loss_take_profit()
+                    for pos, reason in basic_close:
+                        if not any(p.market_id == pos.market_id for p, _ in to_close):
+                            to_close.append((pos, reason))
+                except Exception as e:
+                    logger.warning(f"Step6 止损检查异常: {e}")
+                    # 降级到基本止损
+                    to_close = _risk_manager.check_stop_loss_take_profit()
+
+                # 执行平仓
                 for pos, reason in to_close:
                     logger.info(f"平仓: {pos.question[:40]} | {reason}")
                     if _config.DRY_RUN:
+                        # Step 10: 记录交易 + 喂入校准
                         record = TradeRecord(
                             timestamp=time.time(),
                             market_id=pos.market_id,
@@ -1263,20 +1648,254 @@ def run_bot():
                         _risk_manager.record_trade(record)
                         if _data_store:
                             _data_store.save_trade(record)
+
+                        # Step 10 (续): 喂入校准引擎
+                        if _calibration:
+                            try:
+                                signal_prob = getattr(pos, '_signal_prob', 0.5)
+                                # 判断实际结果: 盈利=1, 亏损=0
+                                actual_outcome = 1 if pos.pnl > 0 else 0
+                                _calibration.record_observation(
+                                    predicted_prob=signal_prob,
+                                    actual_outcome=actual_outcome,
+                                    strategy="STOP_LOSS_TP",
+                                    market_id=pos.market_id,
+                                )
+                                logger.info(f"Step10 校准记录: predicted={signal_prob:.3f}, actual={actual_outcome}, pnl={pos.pnl:.4f}")
+                            except Exception as e:
+                                logger.debug(f"校准记录失败: {e}")
+
                         _risk_manager.remove_position(pos.market_id)
 
-                # 5. V3 OrderBook分析
-                if _orderbook and _executor and _executor.initialized:
-                    try:
-                        for pos in _risk_manager.positions[:5]:
-                            book = _executor.get_order_book(pos.token_id)
-                            if book:
-                                _orderbook.full_analysis(book, pos.token_id, pos.market_id, pos.question)
-                    except Exception as e:
-                        logger.debug(f"Orderbook分析失败: {e}")
+                # ===== Step 7-9: 处理交易机会 (信号合并 → Kelly → 校准 → 风控 → 执行) =====
+                def process_trade_opportunity(opp, strategy_name, default_side, price):
+                    """
+                    V3.5 闭环交易处理:
+                    Step 5: 信号合并
+                    Step 6: Kelly仓位
+                    Step 7: 校准调整
+                    Step 8: 风控检查
+                    Step 9: 执行交易
+                    """
+                    m = opp.get("market", opp)
+                    market_id = m.id if hasattr(m, 'id') else opp.get("market_id", "")
+                    side = opp.get("side", default_side)
+                    trade_price = opp.get("price", price)
 
-                # 6. 处理交易机会
-                # 套利
+                    # 跳过已有仓位
+                    if any(p.market_id == market_id for p in _risk_manager.positions):
+                        return
+
+                    # --- Step 5: 信号合并 ---
+                    signals = []
+                    strategy_weight = _strategy_weights.get(strategy_name, 0.2)
+
+                    # 策略信号概率
+                    if side == "YES":
+                        strategy_prob = min(0.95, trade_price + 0.05 + opp.get("arb_spread", 0) * 0.5)
+                    else:
+                        strategy_prob = max(0.05, 1 - trade_price - 0.05 - opp.get("arb_spread", 0) * 0.5)
+                    signals.append({
+                        "strategy": strategy_name,
+                        "probability": strategy_prob,
+                        "weight": strategy_weight,
+                        "confidence": 0.6,
+                    })
+
+                    # Smart Money信号
+                    if market_id in smart_signals_by_market:
+                        sm = smart_signals_by_market[market_id]
+                        sm_dir = sm["direction"]
+                        sm_strength = sm["strength"]
+                        # 将方向和强度转化为概率估计
+                        if sm_dir == "YES" or sm_dir == side:
+                            sm_prob = min(0.95, trade_price + sm_strength * 0.2)
+                        else:
+                            sm_prob = max(0.05, trade_price - sm_strength * 0.2)
+                        signals.append({
+                            "strategy": "SMART_MONEY",
+                            "probability": sm_prob,
+                            "weight": 0.3,
+                            "confidence": 0.7 if sm["confidence"] == "HIGH" else 0.4,
+                        })
+
+                    # OrderBook信号
+                    if market_id in ob_signals_by_market:
+                        ob = ob_signals_by_market[market_id]
+                        ob_signal = ob["direction"]
+                        ob_strength = ob["strength"]
+                        if ob_signal == "BULLISH":
+                            ob_prob = min(0.95, trade_price + ob_strength * 0.15)
+                        elif ob_signal == "BEARISH":
+                            ob_prob = max(0.05, trade_price - ob_strength * 0.15)
+                        else:
+                            ob_prob = trade_price  # 中性不影响
+                        signals.append({
+                            "strategy": "ORDERBOOK",
+                            "probability": ob_prob,
+                            "weight": 0.2,
+                            "confidence": 0.5,
+                        })
+
+                    # --- Step 6: Kelly仓位计算 ---
+                    trade_amount = _risk_manager.calculate_position_size(_config.INITIAL_CAPITAL)
+                    kelly_fraction = 0.0
+                    kelly_edge = 0.0
+                    kelly_confidence = 0.0
+                    kelly_reason = ""
+
+                    if _kelly:
+                        try:
+                            kelly_cap = getattr(_config, 'KELLY_FRACTION', 0.25)
+                            # 多信号合并Kelly
+                            combined_result = _kelly["combinedKelly"](
+                                signals=signals,
+                                price=trade_price,
+                                side=side,
+                            )
+                            # 置信度调整
+                            sample_size = len(_risk_manager.trade_history) if _risk_manager else 0
+                            adjusted_result = _kelly["confidenceAdjustedKelly"](
+                                kelly_fraction=combined_result.fraction,
+                                confidence=combined_result.confidence,
+                                sample_size=sample_size,
+                                kelly_cap=kelly_cap,
+                            )
+                            # 计算实际仓位
+                            capital = _risk_manager.get_status().get("capital", _config.INITIAL_CAPITAL) if _risk_manager else _config.INITIAL_CAPITAL
+                            trade_amount = _kelly["calculate_position_size_kelly"](
+                                capital=capital,
+                                kelly_fraction=adjusted_result.fraction,
+                                price=trade_price,
+                            )
+                            kelly_fraction = adjusted_result.fraction
+                            kelly_edge = combined_result.edge
+                            kelly_confidence = adjusted_result.confidence
+                            kelly_reason = adjusted_result.reason
+
+                            # 更新全局Kelly状态
+                            bot_state["kelly_state"] = {
+                                "last_fraction": kelly_fraction,
+                                "last_raw_fraction": combined_result.raw_fraction,
+                                "last_edge": kelly_edge,
+                                "last_confidence": kelly_confidence,
+                                "last_adjusted": adjusted_result.adjusted,
+                                "last_reason": kelly_reason,
+                                "kelly_cap": kelly_cap,
+                                "last_position_size": trade_amount,
+                            }
+
+                            logger.info(f"Step6 Kelly: fraction={kelly_fraction:.4f}, edge={kelly_edge:.4f}, size=${trade_amount:.2f}")
+
+                            # Kelly为0则不交易
+                            if kelly_fraction <= 0 or trade_amount <= 0:
+                                logger.info(f"Step6 Kelly=0, 跳过交易: {kelly_reason}")
+                                return
+
+                        except Exception as e:
+                            logger.warning(f"Step6 Kelly计算失败: {e}, 使用默认仓位")
+                            trade_amount = _risk_manager.calculate_position_size(_config.INITIAL_CAPITAL)
+
+                    # --- Step 7: 校准调整 ---
+                    calibration_factor = 1.0
+                    if _calibration:
+                        try:
+                            calibration_factor = _calibration.get_confidence_adjustment(strategy_name)
+                            # 用校准因子调整交易量
+                            trade_amount *= calibration_factor
+                            logger.info(f"Step7 校准因子: {calibration_factor:.3f}, 调整后仓位=${trade_amount:.2f}")
+                        except Exception as e:
+                            logger.debug(f"Step7 校准查询失败: {e}")
+
+                    # --- Step 8: 风控检查 (动态SL + 组合风险 + 基本检查) ---
+                    can, reason = _risk_manager.check_can_trade(trade_amount)
+                    if not can:
+                        logger.info(f"Step8 风控拒绝: {reason}")
+                        return
+
+                    # Portfolio risk检查 (每5个周期检查一次以减少计算)
+                    if _portfolio_risk and scan_count % 5 == 0:
+                        try:
+                            from risk_manager_v3 import PositionInfo
+                            positions = [
+                                PositionInfo(
+                                    market_id=p.market_id,
+                                    question=p.question,
+                                    side=p.side,
+                                    entry_price=p.entry_price,
+                                    current_price=p.current_price,
+                                    amount=p.amount,
+                                    pnl=p.pnl,
+                                )
+                                for p in _risk_manager.positions
+                            ]
+                            # 检查断路器
+                            daily_pnl = _risk_manager.get_status().get("daily_pnl", 0) if _risk_manager else 0
+                            triggered, cb_reason = _portfolio_risk.check_circuit_breakers(daily_pnl, positions)
+                            if triggered:
+                                bot_state["circuit_breaker"] = True
+                                bot_state["circuit_breaker_reason"] = cb_reason
+                                _risk_manager.circuit_breaker = True
+                                _risk_manager.circuit_breaker_reason = cb_reason
+                                logger.critical(f"Step8 组合风险断路器: {cb_reason}")
+                                return
+
+                            # 更新组合风险状态
+                            _portfolio_risk.update_capital(
+                                _config.INITIAL_CAPITAL + (_risk_manager.total_pnl if _risk_manager else 0)
+                            )
+                            var95 = _portfolio_risk.compute_var(positions, 0.95)
+                            cvar95 = _portfolio_risk.compute_cvar(positions, 0.95)
+                            dd_pct = _portfolio_risk.compute_max_drawdown()
+                            heat = _portfolio_risk.get_portfolio_heat(positions)
+                            exposure = _portfolio_risk.get_correlation_adjusted_exposure(positions)
+                            bot_state["risk_advanced"] = {
+                                "var95": round(var95, 4),
+                                "cvar95": round(cvar95, 4),
+                                "max_drawdown_pct": round(dd_pct, 2),
+                                "portfolio_heat": round(heat, 4),
+                                "adjusted_exposure": round(exposure, 2),
+                            }
+                            logger.info(f"Step8 风控: VaR95=${var95:.2f}, CVaR=${cvar95:.2f}, Heat={heat:.2f}")
+                        except Exception as e:
+                            logger.warning(f"Step8 组合风险检查异常: {e}")
+
+                    # --- Step 9: 执行交易 ---
+                    trade_amount = max(trade_amount, _config.MIN_TRADE_SIZE)
+                    logger.info(f"Step9 执行: {strategy_name} {side}@{trade_price:.3f} size=${trade_amount:.2f} Kelly={kelly_fraction:.3f}")
+                    if _config.DRY_RUN:
+                        shares = trade_amount / trade_price if trade_price > 0 else 0
+                        pos = Position(
+                            market_id=market_id,
+                            question=m.question if hasattr(m, 'question') else opp.get("question", ""),
+                            token_id=m.yes_token_id if (hasattr(m, 'yes_token_id') and side == "YES") else (m.no_token_id if hasattr(m, 'no_token_id') else ""),
+                            side=side,
+                            entry_price=trade_price,
+                            amount=shares,
+                            current_price=trade_price,
+                        )
+                        # V3.5: 附加Kelly元数据到Position
+                        pos._signal_prob = signals[0]["probability"] if signals else 0.5
+                        pos._kelly_fraction = kelly_fraction
+                        pos._highest_price = trade_price
+                        _risk_manager.add_position(pos)
+
+                        # Step 10: 记录交易
+                        record = TradeRecord(
+                            timestamp=time.time(),
+                            market_id=market_id,
+                            question=m.question if hasattr(m, 'question') else opp.get("question", ""),
+                            side=side,
+                            action="BUY",
+                            price=trade_price,
+                            amount=trade_amount,
+                            strategy=strategy_name,
+                        )
+                        _risk_manager.record_trade(record)
+                        if _data_store:
+                            _data_store.save_trade(record)
+
+                # --- 套利策略 ---
                 if _config.ENABLE_ARBITRAGE:
                     for opp in opportunities.get("single_arb", []):
                         m = opp["market"]
@@ -1297,6 +1916,9 @@ def run_bot():
                                 entry_price=m.yes_price, amount=yes_shares,
                                 current_price=m.yes_price,
                             )
+                            yes_pos._signal_prob = m.yes_price
+                            yes_pos._kelly_fraction = 0.25
+                            yes_pos._highest_price = m.yes_price
                             _risk_manager.add_position(yes_pos)
                             no_shares = trade_amount / m.no_price if m.no_price > 0 else 0
                             no_pos = Position(
@@ -1305,6 +1927,9 @@ def run_bot():
                                 entry_price=m.no_price, amount=no_shares,
                                 current_price=m.no_price,
                             )
+                            no_pos._signal_prob = m.no_price
+                            no_pos._kelly_fraction = 0.25
+                            no_pos._highest_price = m.no_price
                             _risk_manager.add_position(no_pos)
                             record = TradeRecord(
                                 timestamp=time.time(), market_id=m.id,
@@ -1328,114 +1953,55 @@ def run_bot():
                             continue
                         logger.info(f"多市场套利: {opp.get('event_title','')[:40]} 空间={net_spread*100:.2f}%")
 
-                # 0手续费策略
+                # 0手续费策略 (使用闭环处理)
                 if getattr(_config, 'ENABLE_ZERO_FEE', False):
                     for opp in opportunities.get("zero_fee", []):
-                        m = opp["market"]
-                        if any(p.market_id == m.id for p in _risk_manager.positions):
-                            continue
-                        trade_amount = _risk_manager.calculate_position_size(_config.INITIAL_CAPITAL)
-                        can, reason = _risk_manager.check_can_trade(trade_amount)
-                        if not can:
-                            continue
-                        side = opp["side"]
-                        price = opp["price"]
-                        logger.info(f"0手续费: {m.question[:40]} {side}@{price:.3f}")
-                        if _config.DRY_RUN:
-                            shares = trade_amount / price if price > 0 else 0
-                            pos = Position(
-                                market_id=m.id, question=m.question,
-                                token_id=m.yes_token_id if side == "YES" else m.no_token_id,
-                                side=side, entry_price=price, amount=shares,
-                                current_price=price,
-                            )
-                            _risk_manager.add_position(pos)
-                            record = TradeRecord(
-                                timestamp=time.time(), market_id=m.id,
-                                question=m.question, side=side, action="BUY",
-                                price=price, amount=trade_amount,
-                                strategy="ZERO_FEE_VALUE",
-                            )
-                            _risk_manager.record_trade(record)
-                            if _data_store:
-                                _data_store.save_trade(record)
+                        try:
+                            process_trade_opportunity(opp, "ZERO_FEE_VALUE", opp.get("side", "YES"), opp.get("price", 0.5))
+                        except Exception as e:
+                            logger.debug(f"0手续费交易处理异常: {e}")
 
-                # 均值回归
+                # 均值回归 (使用闭环处理)
                 if _config.ENABLE_MEAN_REVERSION:
                     for opp in opportunities.get("mean_reversion", []):
-                        m = opp["market"]
-                        if opp["confidence"] == "LOW":
+                        m = opp.get("market")
+                        if opp.get("confidence") == "LOW":
                             continue
-                        if any(p.market_id == m.id for p in _risk_manager.positions):
-                            continue
-                        trade_amount = _risk_manager.calculate_position_size(_config.INITIAL_CAPITAL)
-                        can, reason = _risk_manager.check_can_trade(trade_amount)
-                        if not can:
-                            continue
-                        side = opp["side"]
-                        price = opp["price"]
-                        logger.info(f"均值回归: {m.question[:40]} {side}@{price:.3f}")
-                        if _config.DRY_RUN:
-                            shares = trade_amount / price if price > 0 else 0
-                            pos = Position(
-                                market_id=m.id, question=m.question,
-                                token_id=m.yes_token_id if side == "YES" else m.no_token_id,
-                                side=side, entry_price=price, amount=shares,
-                                current_price=price,
-                            )
-                            _risk_manager.add_position(pos)
-                            record = TradeRecord(
-                                timestamp=time.time(), market_id=m.id,
-                                question=m.question, side=side, action="BUY",
-                                price=price, amount=trade_amount,
-                                strategy="MEAN_REVERSION",
-                            )
-                            _risk_manager.record_trade(record)
-                            if _data_store:
-                                _data_store.save_trade(record)
+                        try:
+                            process_trade_opportunity(opp, "MEAN_REVERSION", opp.get("side", "YES"), opp.get("price", 0.5))
+                        except Exception as e:
+                            logger.debug(f"均值回归交易处理异常: {e}")
 
-                # 事件驱动
+                # 事件驱动 (使用闭环处理)
                 if _config.ENABLE_EVENT_DRIVEN:
                     for opp in opportunities.get("event_driven", []):
-                        m = opp["market"]
-                        if not m.is_extreme_price:
+                        m = opp.get("market")
+                        if hasattr(m, 'is_extreme_price') and not m.is_extreme_price:
                             continue
-                        if any(p.market_id == m.id for p in _risk_manager.positions):
-                            continue
-                        trade_amount = _risk_manager.calculate_position_size(_config.INITIAL_CAPITAL) * 0.5
-                        trade_amount = max(trade_amount, _config.MIN_TRADE_SIZE)
-                        can, reason = _risk_manager.check_can_trade(trade_amount)
-                        if not can:
-                            continue
-                        side = opp["side"]
-                        price = opp["price"]
-                        logger.info(f"事件驱动: {m.question[:40]} {side}@{price:.3f}")
-                        if _config.DRY_RUN:
-                            shares = trade_amount / price if price > 0 else 0
-                            pos = Position(
-                                market_id=m.id, question=m.question,
-                                token_id=m.yes_token_id if side == "YES" else m.no_token_id,
-                                side=side, entry_price=price, amount=shares,
-                                current_price=price,
-                            )
-                            _risk_manager.add_position(pos)
-                            record = TradeRecord(
-                                timestamp=time.time(), market_id=m.id,
-                                question=m.question, side=side, action="BUY",
-                                price=price, amount=trade_amount,
-                                strategy="EVENT_DRIVEN",
-                            )
-                            _risk_manager.record_trade(record)
-                            if _data_store:
-                                _data_store.save_trade(record)
+                        try:
+                            process_trade_opportunity(opp, "EVENT_DRIVEN", opp.get("side", "YES"), opp.get("price", 0.5))
+                        except Exception as e:
+                            logger.debug(f"事件驱动交易处理异常: {e}")
 
-                # 7. 更新全局状态
+                # ===== Step 10: 更新全局状态 =====
                 status = _risk_manager.get_status()
                 bot_state["positions_count"] = status["positions_count"]
                 bot_state["daily_pnl"] = status["daily_pnl"]
                 bot_state["total_pnl"] = status["total_pnl"]
                 bot_state["trade_count"] = status["trade_count"]
                 bot_state["circuit_breaker"] = status["circuit_breaker"]
+
+                # 更新组合风险的资金
+                if _portfolio_risk:
+                    try:
+                        _portfolio_risk.update_capital(
+                            _config.INITIAL_CAPITAL + status["total_pnl"]
+                        )
+                        # 记录每日PnL (每20个周期记录一次)
+                        if scan_count % 20 == 0:
+                            _portfolio_risk.record_daily_pnl(status["daily_pnl"])
+                    except Exception:
+                        pass
 
                 # PnL 时间线
                 pnl_point = {
@@ -1448,7 +2014,45 @@ def run_bot():
                 if len(bot_state["pnl_history"]) > 200:
                     bot_state["pnl_history"] = bot_state["pnl_history"][-200:]
 
-                # 8. 保存状态
+                # ===== Step 11: 定期回测 (每50个周期) =====
+                if scan_count % 50 == 0 and _backtester_v3 and _data_store:
+                    try:
+                        capital = _config.INITIAL_CAPITAL
+                        results = _backtester_v3.compare_strategies(capital=capital, days=30)
+                        bot_state["backtest_results"] = results
+                        logger.info(f"Step11 回测完成: {len(results)} 策略")
+                    except Exception as e:
+                        logger.warning(f"Step11 回测失败: {e}")
+
+                # ===== Step 12: 校准反馈 → 调整策略权重 (每25个周期) =====
+                if scan_count % 25 == 0 and _calibration:
+                    try:
+                        for strategy_name in list(_strategy_weights.keys()):
+                            conf_adj = _calibration.get_confidence_adjustment(strategy_name)
+                            # 校准因子 > 1.0 表示策略可靠，增加权重
+                            # 校准因子 < 0.7 表示策略不可靠，降低权重
+                            old_weight = _strategy_weights[strategy_name]
+                            new_weight = old_weight * conf_adj
+                            new_weight = max(0.05, min(new_weight, 0.5))  # 权重范围 [0.05, 0.5]
+                            _strategy_weights[strategy_name] = round(new_weight, 3)
+                            if abs(new_weight - old_weight) > 0.01:
+                                logger.info(f"Step12 权重调整: {strategy_name} {old_weight:.3f} → {new_weight:.3f} (factor={conf_adj:.3f})")
+
+                        # 更新校准状态
+                        metrics = _calibration.get_metrics()
+                        bot_state["calibration_state"] = {
+                            "brier_score": metrics.brier_score,
+                            "ece": metrics.ece,
+                            "bss": metrics.brier_skill_score,
+                            "reliability": metrics.reliability,
+                            "sample_size": metrics.sample_size,
+                            "confidence_adjustment": _calibration.get_confidence_adjustment(),
+                        }
+                        logger.info(f"Step12 校准反馈: Brier={metrics.brier_score:.4f}, ECE={metrics.ece:.4f}, BSS={metrics.brier_skill_score:.4f}")
+                    except Exception as e:
+                        logger.warning(f"Step12 校准反馈异常: {e}")
+
+                # 保存状态
                 if scan_count % 10 == 0:
                     try:
                         with open(state_file, "w") as f:
@@ -1461,7 +2065,9 @@ def run_bot():
 
                 logger.info(
                     f"扫描#{scan_count} | 持仓{status['positions_count']}/{_config.MAX_POSITIONS} | "
-                    f"日PnL ${status['daily_pnl']:+.2f} | 累计 ${status['total_pnl']:+.2f}"
+                    f"日PnL ${status['daily_pnl']:+.2f} | 累计 ${status['total_pnl']:+.2f} | "
+                    f"Kelly={bot_state['kelly_state']['last_fraction']:.3f} | "
+                    f"VaR95=${bot_state['risk_advanced'].get('var95', 0):.2f}"
                 )
 
                 time.sleep(_config.SCAN_INTERVAL)
@@ -1497,11 +2103,12 @@ def main():
 
     print()
     print("=" * 55)
-    print("  Polymarket V3 量化交易系统 - REST API")
+    print("  Polymarket V3.5 量化交易系统 - REST API")
+    print("  12步闭环数据流: WS→Scanner→SM→OB→Combine→Kelly→Calib→Risk→Exec→Record→BT→CalibFB")
     print("=" * 55)
     print(f"  模式:     {mode}")
     print(f"  API端口:  {port}")
-    print(f"  端点:     /api/status /api/positions /api/trades ...")
+    print(f"  端点:     /api/status /api/positions /api/trades /api/kelly /api/risk-advanced ...")
     print("=" * 55)
     print()
 
