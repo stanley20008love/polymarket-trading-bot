@@ -1,5 +1,5 @@
 """
-Polymarket 量化交易系统 V5.0 - 完整 REST API 服务器 + 专业前端仪表盘
+Polymarket 量化交易系统 V5.1 - 完整 REST API 服务器 + 专业前端仪表盘
 14步闭环数据流: WS→Scanner→SmartMoney→OrderBook→WeatherData→SignalCombiner→Kelly→Calibration→Risk→Execute→Record→Backtest→CalibrationFeedback→StrategyWeightUpdate
 """
 import json
@@ -13,7 +13,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 # 全局共享状态 - bot主线程写入，API线程读取
 # ============================================================
 bot_state = {
-    "version": "5.0",
+    "version": "5.1",
     "status": "starting",
     "scan_count": 0,
     "positions_count": 0,
@@ -151,7 +151,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Polymarket V5.0 Quant Dashboard</title>
+<title>Polymarket V5.1 Quant Dashboard</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 :root{
@@ -271,8 +271,8 @@ tr:hover td{background:rgba(59,130,246,.03)}
 <!-- Header -->
 <div class="header">
   <div class="header-left">
-    <div class="logo">Polymarket V5.0</div>
-    <span class="version" id="version">v5.0</span>
+    <div class="logo">Polymarket V5.1</div>
+    <span class="version" id="version">v5.1</span>
     <div id="statusBadge" class="status-badge status-starting">
       <span class="status-dot"></span>
       <span id="statusText">Starting</span>
@@ -1361,7 +1361,7 @@ def run_bot():
     """
     global _risk_manager, _smart_money, _orderbook, _data_store, _executor, _scanner, _config
     global _kelly, _orderbook_engine, _calibration, _dynamic_stop, _portfolio_risk, _backtester_v3, _ws_client
-    global _strategy_weights
+    global _strategy_weights, _notifier
 
     import logging
     import sys
@@ -1387,6 +1387,11 @@ def run_bot():
         bot_state["strategies"]["event_driven"] = "enabled" if _config.ENABLE_EVENT_DRIVEN else "disabled"
         bot_state["strategies"]["zero_fee"] = "enabled" if getattr(_config, 'ENABLE_ZERO_FEE', False) else "disabled"
         bot_state["strategies"]["multi_market_arb"] = "enabled" if getattr(_config, 'ENABLE_MULTI_MARKET_ARB', False) else "disabled"
+        bot_state["strategies"]["time_decay"] = "enabled"
+        bot_state["strategies"]["stat_arb"] = "enabled"
+        bot_state["strategies"]["weather"] = "enabled" if getattr(_config, 'ENABLE_WEATHER', True) else "disabled"
+        bot_state["strategies"]["dump_hedge"] = "enabled" if getattr(_config, 'ENABLE_DUMP_HEDGE', True) else "disabled"
+        bot_state["strategies"]["counter_wallet"] = "enabled" if getattr(_config, 'ENABLE_COUNTER_WALLET', False) else "disabled"
 
         # 初始化核心模块
         _scanner = MarketScanner(_config)
@@ -2034,6 +2039,14 @@ def run_bot():
                     except Exception as e:
                         logger.debug(f"统计套利交易处理异常: {e}")
 
+                # V5新增: 天气市场策略
+                if getattr(_config, 'ENABLE_WEATHER', True):
+                    for opp in opportunities.get("weather", []):
+                        try:
+                            process_trade_opportunity(opp, "WEATHER", opp.get("side", "YES"), opp.get("price", 0.5))
+                        except Exception as e:
+                            logger.debug(f"天气市场交易处理异常: {e}")
+
                 # ===== Step 10: 更新全局状态 =====
                 status = _risk_manager.get_status()
                 bot_state["positions_count"] = status["positions_count"]
@@ -2136,12 +2149,22 @@ def run_bot():
 
 
 def setup_logging(level: str = "INFO"):
-    import logging
-    import sys
+    import logging, sys
+    from datetime import datetime
+    log_dir = os.path.join(os.path.dirname(__file__), "logs")
+    os.makedirs(log_dir, exist_ok=True)
+    log_format = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+    date_format = "%Y-%m-%d %H:%M:%S"
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(logging.Formatter(log_format, date_format))
+    file_handler = logging.FileHandler(
+        os.path.join(log_dir, f"trading_{datetime.now().strftime('%Y%m%d')}.log"),
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(logging.Formatter(log_format, date_format))
     logging.basicConfig(
         level=getattr(logging, level.upper(), logging.INFO),
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-        handlers=[logging.StreamHandler(sys.stdout)],
+        handlers=[console_handler, file_handler],
     )
 
 

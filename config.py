@@ -1,7 +1,7 @@
 """
-Polymarket 量化交易系统 V5.0 - 配置管理
+Polymarket 量化交易系统 V5.1 - 配置管理
 基于开源研究(github.com/cobra0xbear, alteregoeth-ai/weatherbot)和学术论文(arXiv:2412.14144)
-V5.0新增: 天气市场策略、对冲策略、反向跟单、校准反馈闭环
+V5.1新增: 天气市场策略、对冲策略、反向跟单、校准反馈闭环
 """
 import os
 from dotenv import load_dotenv
