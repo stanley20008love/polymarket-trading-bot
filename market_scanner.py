@@ -1,10 +1,10 @@
 """
-Polymarket 量化交易系统 V2 - 市场扫描器
+Polymarket 量化交易系统 V6.0 - 市场扫描器 (聚焦天气策略版)
 核心升级：
 1. 真实手续费模型: fee = shares × feeRate × price × (1-price)
-2. 多市场互斥套利: negRisk事件YES总和偏离1.0
-3. 地缘政治0手续费优先: 最适合100U小资金
-4. 体育市场maker返佣: 限价单=0手续费+25%返佣
+2. V6.0 天气策略为核心: GFS集合预报 vs 市场概率
+3. 次要城市优先: 流动性低但edge更宽
+4. 仅天气策略启用: 其他策略代码保留但默认关闭
 """
 import json
 import logging
@@ -627,65 +627,93 @@ class MarketScanner:
 
     def find_weather_opportunities(self, markets: list[MarketInfo]) -> list[dict]:
         """
-        V4.0新增策略: 天气市场交易
-        来源: alteregoeth-ai/weatherbot, 375+温度市场, $2M日交易量
+        V6.0核心策略: 天气市场交易 (GFS集合预报驱动)
         
-        逻辑: Polymarket有大量天气温度市场(20+城市)
-        当市场隐含概率与气象预报偏差>5%时, 存在定价错误
+        来源与实证:
+        - ColdMath: $300→$219K 天气套利机器人
+        - alteregoeth-ai/weatherbot: 开源天气策略
+        - 375+温度市场, $2M日交易量
+        
+        V6.0升级:
+        - 接入GFS集合预报数据(31成员)
+        - 计算模型概率 vs 市场概率的偏差
+        - 偏差>5%且扣除手续费后有正edge才交易
+        - 次要城市(buenos-aires, cape-town)优先: 流动性低但edge更宽
         """
         opportunities = []
+        weather_data_fetcher = getattr(self, '_weather_fetcher', None)
+        
         for m in markets:
             # 筛选天气市场
             if m.category != "weather":
                 continue
-            if m.volume < getattr(self.config, 'WEATHER_MIN_VOLUME', 50000):
+            if m.volume < getattr(self.config, 'WEATHER_MIN_VOLUME', 10000):
                 continue
-            if m.liquidity < getattr(self.config, 'WEATHER_MIN_LIQUIDITY', 10000):
+            if m.liquidity < getattr(self.config, 'WEATHER_MIN_LIQUIDITY', 3000):
                 continue
             
-            # 天气市场通常价格在0.3-0.7之间
-            # 寻找极端价格(市场过度自信或低估)
+            # V6.0: 使用GFS集合预报数据计算模型概率
+            if weather_data_fetcher:
+                try:
+                    weather_market = weather_data_fetcher.parse_weather_market(m.raw)
+                    if weather_market:
+                        mispricing = weather_data_fetcher.find_mispricing(weather_market)
+                        if mispricing:
+                            mispricing["market"] = m  # 添加MarketInfo引用
+                            opportunities.append(mispricing)
+                            continue  # GFS数据优先
+                except Exception as e:
+                    logger.debug(f"GFS天气数据分析失败: {e}")
+            
+            # Fallback: 基于价格极端性的简单策略(无GFS数据时)
+            # 这在数据源不可用时提供兜底
             if m.yes_price > 0.01 and m.yes_price < 0.15:
                 potential_return = (1.0 - m.yes_price) / m.yes_price
-                # 天气市场手续费通常5%
                 fee = m.calc_fee(1, m.yes_price)
                 net_return = potential_return - fee / m.yes_price
-                if net_return > 0.02:  # 至少2%净收益
+                if net_return > 0.03:  # 无GFS时要求更高净收益
                     opportunities.append({
                         "market": m,
-                        "type": "WEATHER_MISPRICED",
+                        "type": "WEATHER_EXTREME_LOW",
                         "side": "YES",
                         "price": m.yes_price,
                         "potential_return": potential_return,
                         "net_return": net_return,
                         "arb_spread": net_return,
                         "taker_fee_rate": m.taker_fee_rate,
-                        "confidence": "HIGH" if m.yes_price < 0.08 else "MEDIUM",
-                        "reason": f"天气市场定价错误 YES={m.yes_price:.3f} 潜在回报{potential_return:.1f}x 净收益{net_return:.1%}",
+                        "confidence": "LOW",  # 无GFS数据降低置信度
+                        "reason": f"天气市场极端低价(无GFS) YES={m.yes_price:.3f} 净收益{net_return:.1%}",
                     })
             elif m.yes_price > 0.85 and m.no_price > 0.01:
                 potential_return = (1.0 - m.no_price) / m.no_price
                 fee = m.calc_fee(1, m.no_price)
                 net_return = potential_return - fee / m.no_price
-                if net_return > 0.02:
+                if net_return > 0.03:
                     opportunities.append({
                         "market": m,
-                        "type": "WEATHER_MISPRICED",
+                        "type": "WEATHER_EXTREME_HIGH",
                         "side": "NO",
                         "price": m.no_price,
                         "potential_return": potential_return,
                         "net_return": net_return,
                         "arb_spread": net_return,
                         "taker_fee_rate": m.taker_fee_rate,
-                        "confidence": "HIGH" if m.yes_price > 0.92 else "MEDIUM",
-                        "reason": f"天气市场定价错误 NO={m.no_price:.3f} 潜在回报{potential_return:.1f}x 净收益{net_return:.1%}",
+                        "confidence": "LOW",
+                        "reason": f"天气市场极端高价(无GFS) NO={m.no_price:.3f} 净收益{net_return:.1%}",
                     })
         
-        opportunities.sort(key=lambda x: x["net_return"], reverse=True)
+        # V6.0: 优先排序: GFS数据驱动 > 简单极端价格
+        def sort_key(opp):
+            has_gfs = "GFS" in opp.get("type", "")
+            edge = opp.get("net_edge", opp.get("net_return", 0))
+            conf = {"HIGH": 3, "MEDIUM": 2, "LOW": 1}.get(opp.get("confidence"), 0)
+            return (has_gfs, conf, edge)
+        
+        opportunities.sort(key=sort_key, reverse=True)
         return opportunities
 
     def scan_all(self) -> dict[str, list[dict]]:
-        """执行全部V3扫描"""
+        """执行全部扫描 (V6.0: 默认仅天气策略)"""
         markets = self.fetch_active_markets()
 
         results = {
@@ -695,36 +723,41 @@ class MarketScanner:
             "zero_fee": [],
             "mean_reversion": [],
             "event_driven": [],
-            "time_decay": [],      # V3新增
-            "stat_arb": [],        # V3新增
-            "weather": [],        # V4.0新增
+            "time_decay": [],
+            "stat_arb": [],
+            "weather": [],
         }
 
-        if self.config.ENABLE_ARBITRAGE:
+        # V6.0核心: 天气策略优先扫描
+        if getattr(self.config, 'ENABLE_WEATHER', True):
+            results["weather"] = self.find_weather_opportunities(markets)
+            logger.info(f"天气市场(GFS): {len(results['weather'])}个")
+
+        # 其他策略 (V6.0默认关闭，保留代码供后续启用)
+        if getattr(self.config, 'ENABLE_ARBITRAGE', False):
             results["single_arb"] = self.find_single_market_arbitrage(markets)
             logger.info(f"单市场套利: {len(results['single_arb'])}个")
 
-        if self.config.ENABLE_MULTI_MARKET_ARB:
+        if getattr(self.config, 'ENABLE_MULTI_MARKET_ARB', False):
             results["multi_arb"] = self.find_multi_market_arbitrage()
             logger.info(f"多市场套利: {len(results['multi_arb'])}个")
 
-        if self.config.ENABLE_ZERO_FEE:
+        if getattr(self.config, 'ENABLE_ZERO_FEE', False):
             results["zero_fee"] = self.find_zero_fee_opportunities(markets)
             logger.info(f"0手续费机会: {len(results['zero_fee'])}个")
 
-        if self.config.ENABLE_MEAN_REVERSION:
+        if getattr(self.config, 'ENABLE_MEAN_REVERSION', False):
             results["mean_reversion"] = self.find_mean_reversion_opportunities(markets)
             logger.info(f"均值回归: {len(results['mean_reversion'])}个")
 
-        if self.config.ENABLE_EVENT_DRIVEN:
+        if getattr(self.config, 'ENABLE_EVENT_DRIVEN', False):
             results["event_driven"] = self.find_event_driven_opportunities(markets)
             logger.info(f"事件驱动: {len(results['event_driven'])}个")
 
-        # V3新增策略
-        results["time_decay"] = self.find_time_decay_opportunities(markets)
-        logger.info(f"时间衰减: {len(results['time_decay'])}个")
-
-        results["stat_arb"] = self.find_stat_arb_opportunities(markets)
-        logger.info(f"统计套利: {len(results['stat_arb'])}个")
+        # V3策略 (默认关闭)
+        if results.get("time_decay") is not None and not results.get("time_decay"):
+            results["time_decay"] = []  # 不主动扫描
+        if results.get("stat_arb") is not None and not results.get("stat_arb"):
+            results["stat_arb"] = []
 
         return results

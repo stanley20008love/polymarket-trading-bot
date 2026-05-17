@@ -1,7 +1,8 @@
 """
-Polymarket 量化交易系统 V5.2 - 完整 REST API 服务器 + 专业前端仪表盘
-14步闭环数据流: WS→Scanner→SmartMoney→OrderBook→WeatherData→SignalCombiner→Kelly→Calibration→Risk→Execute→Record→Backtest→CalibrationFeedback→StrategyWeightUpdate
-V5.2修复: main()版本号、dump_hedge/counter_wallet策略处理、STRATEGY_EDGE补全
+Polymarket 量化交易系统 V6.0 - 完整 REST API 服务器 + 专业前端仪表盘
+聚焦策略版: 关闭8个无效策略, 仅保留Weather(GFS集合预报驱动)
+14步闭环数据流: WS→Scanner→WeatherData(GFS)→SignalCombiner→Kelly→Calibration→Risk→Execute→Record→Backtest→CalibrationFeedback
+V6.0核心变更: 单策略聚焦+GFS数据源+校准反馈+策略专属风控
 """
 import json
 import os
@@ -14,7 +15,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 # 全局共享状态 - bot主线程写入，API线程读取
 # ============================================================
 bot_state = {
-    "version": "5.2",
+    "version": "6.0",
     "status": "starting",
     "scan_count": 0,
     "positions_count": 0,
@@ -128,19 +129,20 @@ _portfolio_risk = None
 _backtester_v3 = None
 _ws_client = None
 
-# V5.0 策略权重 — 基于开源研究和学术论文(arXiv:2412.14144)调整
-# 修复: 根据学术研究调整初始权重 — 均值回归和统计套利是已验证的最有效策略
+# V6.0 策略权重 — 聚焦策略版
+# 诊断结论: 9策略Edge=-4%, Kelly=0% → 关8留1, 聚焦Weather
+# Weather是唯一有学术支撑(ColdMath $300→$219K)和实证数据的策略
 _strategy_weights = {
-    "ARBITRAGE": 0.08,         # V4降低: 41%市场存在但窗口仅2.7s，零售难以捕获(tradesignal.se)
-    "MEAN_REVERSION": 0.20,    # V4降低: ResearchGate验证可盈利，但100U小资金手续费侵蚀严重
-    "EVENT_DRIVEN": 0.10,      # V4降低: 需要放宽极端价格限制，反转信号不准
-    "ZERO_FEE_VALUE": 0.12,    # V4提高: 0手续费地缘政治市场是小资金最大优势
-    "STOP_LOSS_TP": 0.03,      # 风控不是策略
-    "TIME_DECAY": 0.15,        # 保持: 临近结算市场的确定性收益(medium.com/illumination)
-    "STAT_ARB": 0.10,          # 保持: spread_fade + momentum
-    "WEATHER": 0.15,           # V4新增: 天气市场$2M日交易量, NOAA数据对齐(alteregoeth-ai/weatherbot)
-    "DUMP_HEDGE": 0.05,        # V4新增: 15min BTC市场对冲策略(Bird-eye-pp/polymarket-arbitrage-trading-bot)
-    "COUNTER_WALLET": 0.02,    # V4新增: 反向跟单亏损钱包(Reddit社区验证)
+    "WEATHER": 1.00,           # V6: 100%权重给Weather (唯一启用的策略)
+    "ARBITRAGE": 0.00,         # V6: 关闭 (零售延迟无法捕获, Edge=0)
+    "MEAN_REVERSION": 0.00,    # V6: 关闭 (二元市场无均值, 理论基础薄弱)
+    "EVENT_DRIVEN": 0.00,      # V6: 关闭 (10s扫描太慢, 实际是追涨杀跌)
+    "ZERO_FEE_VALUE": 0.00,    # V6: 关闭 (非独立策略, 是执行方式)
+    "STOP_LOSS_TP": 0.00,      # 风控不是策略
+    "TIME_DECAY": 0.00,        # V6: 关闭 (需要独立真实验证)
+    "STAT_ARB": 0.00,          # V6: 关闭 (0样本, 数据不足)
+    "DUMP_HEDGE": 0.00,        # V6: 关闭 (BTC市场非核心)
+    "COUNTER_WALLET": 0.00,    # V6: 关闭 (信号源未验证)
 }
 
 
@@ -152,7 +154,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Polymarket V5.2 Quant Dashboard</title>
+<title>Polymarket V6.0 Weather Focus Dashboard</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 :root{
@@ -272,8 +274,8 @@ tr:hover td{background:rgba(59,130,246,.03)}
 <!-- Header -->
 <div class="header">
   <div class="header-left">
-    <div class="logo">Polymarket V5.2</div>
-    <span class="version" id="version">v5.2</span>
+    <div class="logo">Polymarket V6.0</div>
+    <span class="version" id="version">v6.0</span>
     <div id="statusBadge" class="status-badge status-starting">
       <span class="status-dot"></span>
       <span id="statusText">Starting</span>
@@ -1380,25 +1382,38 @@ def run_bot():
 
         _config = Config()
 
-        # 更新全局状态
+        # 更新全局状态 — V6.0: 仅Weather启用
         bot_state["mode"] = "dry_run" if _config.DRY_RUN else "LIVE"
         bot_state["capital"] = _config.INITIAL_CAPITAL
-        bot_state["strategies"]["arbitrage"] = "enabled" if _config.ENABLE_ARBITRAGE else "disabled"
-        bot_state["strategies"]["mean_reversion"] = "enabled" if _config.ENABLE_MEAN_REVERSION else "disabled"
-        bot_state["strategies"]["event_driven"] = "enabled" if _config.ENABLE_EVENT_DRIVEN else "disabled"
-        bot_state["strategies"]["zero_fee"] = "enabled" if getattr(_config, 'ENABLE_ZERO_FEE', False) else "disabled"
-        bot_state["strategies"]["multi_market_arb"] = "enabled" if getattr(_config, 'ENABLE_MULTI_MARKET_ARB', False) else "disabled"
-        bot_state["strategies"]["time_decay"] = "enabled"
-        bot_state["strategies"]["stat_arb"] = "enabled"
+        bot_state["strategies"]["arbitrage"] = "disabled"  # V6: 关闭
+        bot_state["strategies"]["mean_reversion"] = "disabled"  # V6: 关闭
+        bot_state["strategies"]["event_driven"] = "disabled"  # V6: 关闭
+        bot_state["strategies"]["zero_fee"] = "disabled"  # V6: 关闭
+        bot_state["strategies"]["multi_market_arb"] = "disabled"  # V6: 关闭
+        bot_state["strategies"]["time_decay"] = "disabled"  # V6: 关闭
+        bot_state["strategies"]["stat_arb"] = "disabled"  # V6: 关闭
         bot_state["strategies"]["weather"] = "enabled" if getattr(_config, 'ENABLE_WEATHER', True) else "disabled"
-        bot_state["strategies"]["dump_hedge"] = "enabled" if getattr(_config, 'ENABLE_DUMP_HEDGE', True) else "disabled"
-        bot_state["strategies"]["counter_wallet"] = "enabled" if getattr(_config, 'ENABLE_COUNTER_WALLET', False) else "disabled"
+        bot_state["strategies"]["dump_hedge"] = "disabled"  # V6: 关闭
+        bot_state["strategies"]["counter_wallet"] = "disabled"  # V6: 关闭
 
         # 初始化核心模块
         _scanner = MarketScanner(_config)
         _risk_manager = RiskManager(_config)
         _executor = OrderExecutor(_config)
         _notifier = Notifier(_config)
+
+        # V6.0 核心: GFS/Open-Meteo 天气数据源
+        _weather_fetcher = None
+        try:
+            from weather_data import WeatherDataFetcher
+            _weather_fetcher = WeatherDataFetcher(_config)
+            # 将天气数据获取器注入到Scanner中
+            _scanner._weather_fetcher = _weather_fetcher
+            bot_state["v3_modules"]["weather_fetcher"] = "enabled"
+            logger.info("V6.0 WeatherDataFetcher (GFS/Open-Meteo) 初始化成功")
+        except Exception as e:
+            logger.warning(f"V6.0 WeatherDataFetcher 初始化失败: {e}")
+            bot_state["v3_modules"]["weather_fetcher"] = "error"
 
         # V3 模块
         try:
@@ -1530,9 +1545,9 @@ def run_bot():
         scan_count = 0
 
         mode = "模拟" if _config.DRY_RUN else "实盘"
-        logger.info(f"V5.2 交易系统启动 [{mode}] ${_config.INITIAL_CAPITAL} - 14步闭环数据流")
+        logger.info(f"V6.0 交易系统启动 [{mode}] ${_config.INITIAL_CAPITAL} - Weather聚焦策略(GFS集合预报)")
         try:
-            _notifier.system_alert(f"V5.2 交易系统启动 [{mode}] ${_config.INITIAL_CAPITAL}")
+            _notifier.system_alert(f"V6.0 交易系统启动 [{mode}] ${_config.INITIAL_CAPITAL} - Weather Only")
         except Exception:
             pass
 
@@ -1734,31 +1749,35 @@ def run_bot():
                     signals = []
                     strategy_weight = _strategy_weights.get(strategy_name, 0.2)
 
-                    # ===== 修复: 动态策略概率计算 (替代hardcoded +5%) =====
-                    # 根据策略类型计算不同edge，来源: 学术研究 + 顶级bot分析
+                    # ===== V6.0: 动态策略概率计算 =====
+                    # Weather策略: 使用GFS集合预报的真实模型概率
+                    # 其他策略: 保留但默认不触发
                     STRATEGY_EDGE = {
-                        "ARBITRAGE": 0.08,         # 套利: 边际由arb_spread决定
-                        "MEAN_REVERSION": 0.15,    # 均值回归: 深度低估/高估有更大edge
-                        "EVENT_DRIVEN": 0.10,      # 事件驱动: 价格过激反应的回归空间
-                        "ZERO_FEE_VALUE": 0.06,    # 0手续费: 仅费率优势
-                        "TIME_DECAY": 0.05,        # 时间衰减: 临近结算的确定性收益
-                        "MARKET_MAKING": 0.03,     # 做市: spread捕获
-                        "STAT_ARB": 0.07,          # 统计套利: 价格异常
-                        "WEATHER": 0.08,           # V5.2补全: 天气市场NOAA数据对齐
-                        "DUMP_HEDGE": 0.04,        # V5.2补全: 15min BTC对冲
-                        "COUNTER_WALLET": 0.03,    # V5.2补全: 反向跟单亏损钱包
+                        "WEATHER": 0.08,           # V6核心: GFS集合预报 vs 市场概率
+                        "ARBITRAGE": 0.00,         # V6: 关闭
+                        "MEAN_REVERSION": 0.00,    # V6: 关闭
+                        "EVENT_DRIVEN": 0.00,      # V6: 关闭
+                        "ZERO_FEE_VALUE": 0.00,    # V6: 关闭
+                        "TIME_DECAY": 0.00,        # V6: 关闭
+                        "MARKET_MAKING": 0.00,     # V6: 关闭
+                        "STAT_ARB": 0.00,          # V6: 关闭
+                        "DUMP_HEDGE": 0.00,        # V6: 关闭
+                        "COUNTER_WALLET": 0.00,    # V6: 关闭
                     }
-                    base_edge = STRATEGY_EDGE.get(strategy_name, 0.05)
+                    base_edge = STRATEGY_EDGE.get(strategy_name, 0.0)
 
-                    # 均值回归: 价格越极端edge越大
-                    if strategy_name == "MEAN_REVERSION":
-                        # 价格离0.5越远，edge越大 (二次函数)
+                    # V6.0: Weather策略使用GFS模型概率
+                    if strategy_name == "WEATHER" and opp.get("model_prob"):
+                        # GFS集合预报提供了真实的概率估计
+                        model_prob = opp["model_prob"]
+                        market_prob = opp.get("market_prob", trade_price)
+                        strategy_prob = model_prob  # 直接使用GFS概率
+                        base_edge = abs(model_prob - market_prob)
+                    elif strategy_name == "MEAN_REVERSION":
                         deviation = abs(trade_price - 0.5)
-                        base_edge = 0.05 + deviation * 0.4  # price=0.10→edge=0.21, price=0.05→edge=0.23
-                    # 套利: edge由实际spread决定
+                        base_edge = 0.05 + deviation * 0.4
                     elif strategy_name == "ARBITRAGE":
                         base_edge = max(0.03, opp.get("arb_spread", 0.03))
-                    # 事件驱动: 价格变化越大edge越大
                     elif strategy_name == "EVENT_DRIVEN":
                         price_change = abs(opp.get("price_change_pct", 10))
                         base_edge = min(0.20, 0.05 + price_change * 0.01)
@@ -1971,22 +1990,20 @@ def run_bot():
                         if _data_store:
                             _data_store.save_trade(record)
 
-                # --- 套利策略 ---
-                # 修复: 套利也走Kelly路径，不用固定仓位
-                if _config.ENABLE_ARBITRAGE:
+                # --- 套利策略 (V6: 默认关闭) ---
+                if getattr(_config, 'ENABLE_ARBITRAGE', False):
                     for opp in opportunities.get("single_arb", []):
                         m = opp["market"]
                         if opp["arb_spread"] * 100 < _config.ARB_MIN_SPREAD:
                             continue
                         if any(p.market_id == m.id for p in _risk_manager.positions):
                             continue
-                        # 套利走process_trade_opportunity以获得Kelly仓位
                         try:
                             process_trade_opportunity(opp, "ARBITRAGE", "YES", opp.get("price", m.yes_price if hasattr(m, 'yes_price') else 0.5))
                         except Exception as e:
                             logger.debug(f"套利交易处理异常: {e}")
 
-                # 多市场套利
+                # 多市场套利 (V6: 默认关闭)
                 if getattr(_config, 'ENABLE_MULTI_MARKET_ARB', False):
                     for opp in opportunities.get("multi_arb", []):
                         markets = opp.get("markets", [])
@@ -1998,7 +2015,7 @@ def run_bot():
                             continue
                         logger.info(f"多市场套利: {opp.get('event_title','')[:40]} 空间={net_spread*100:.2f}%")
 
-                # 0手续费策略 (使用闭环处理)
+                # 0手续费策略 (V6: 默认关闭)
                 if getattr(_config, 'ENABLE_ZERO_FEE', False):
                     for opp in opportunities.get("zero_fee", []):
                         try:
@@ -2006,8 +2023,8 @@ def run_bot():
                         except Exception as e:
                             logger.debug(f"0手续费交易处理异常: {e}")
 
-                # 均值回归 (使用闭环处理)
-                if _config.ENABLE_MEAN_REVERSION:
+                # 均值回归 (V6: 默认关闭)
+                if getattr(_config, 'ENABLE_MEAN_REVERSION', False):
                     for opp in opportunities.get("mean_reversion", []):
                         m = opp.get("market")
                         if opp.get("confidence") == "LOW":
@@ -2017,10 +2034,8 @@ def run_bot():
                         except Exception as e:
                             logger.debug(f"均值回归交易处理异常: {e}")
 
-                # 事件驱动 (使用闭环处理)
-                # 修复: 放宽极端价格限制 — 原版要求is_extreme_price(YES<0.10或>0.90)
-                # 这导致只能交易流动性差的极端市场。改为: 所有价格区间均可，但edge动态调整
-                if _config.ENABLE_EVENT_DRIVEN:
+                # 事件驱动 (V6: 默认关闭)
+                if getattr(_config, 'ENABLE_EVENT_DRIVEN', False):
                     for opp in opportunities.get("event_driven", []):
                         m = opp.get("market")
                         try:
@@ -2028,44 +2043,21 @@ def run_bot():
                         except Exception as e:
                             logger.debug(f"事件驱动交易处理异常: {e}")
 
-                # V3新增: 时间衰减策略
-                for opp in opportunities.get("time_decay", []):
-                    try:
-                        process_trade_opportunity(opp, "TIME_DECAY", opp.get("side", "YES"), opp.get("price", 0.5))
-                    except Exception as e:
-                        logger.debug(f"时间衰减交易处理异常: {e}")
+                # 时间衰减 (V6: 默认关闭)
+                # 统计套利 (V6: 默认关闭)
 
-                # V3新增: 统计套利策略
-                for opp in opportunities.get("stat_arb", []):
-                    try:
-                        opp_type = opp.get("type", "STAT_ARB")
-                        process_trade_opportunity(opp, "STAT_ARB", opp.get("side", "YES"), opp.get("price", 0.5))
-                    except Exception as e:
-                        logger.debug(f"统计套利交易处理异常: {e}")
-
-                # V5新增: 天气市场策略
+                # ===== V6.0 核心: 天气市场策略 (唯一启用) =====
                 if getattr(_config, 'ENABLE_WEATHER', True):
                     for opp in opportunities.get("weather", []):
                         try:
+                            # V6.0: GFS驱动的天气信号有真实的模型概率
+                            opp_type = opp.get("type", "WEATHER_MISPRICED")
                             process_trade_opportunity(opp, "WEATHER", opp.get("side", "YES"), opp.get("price", 0.5))
                         except Exception as e:
                             logger.debug(f"天气市场交易处理异常: {e}")
 
-                # V5.2新增: 对冲策略 (15min BTC市场)
-                if getattr(_config, 'ENABLE_DUMP_HEDGE', True):
-                    for opp in opportunities.get("dump_hedge", []):
-                        try:
-                            process_trade_opportunity(opp, "DUMP_HEDGE", opp.get("side", "YES"), opp.get("price", 0.5))
-                        except Exception as e:
-                            logger.debug(f"对冲策略交易处理异常: {e}")
-
-                # V5.2新增: 反向跟单策略
-                if getattr(_config, 'ENABLE_COUNTER_WALLET', False):
-                    for opp in opportunities.get("counter_wallet", []):
-                        try:
-                            process_trade_opportunity(opp, "COUNTER_WALLET", opp.get("side", "YES"), opp.get("price", 0.5))
-                        except Exception as e:
-                            logger.debug(f"反向跟单交易处理异常: {e}")
+                # V6: 对冲和反向跟单 (默认关闭)
+                # 这些策略保留代码但V6.0不启用
 
                 # ===== Step 10: 更新全局状态 =====
                 status = _risk_manager.get_status()
@@ -2108,16 +2100,17 @@ def run_bot():
                     except Exception as e:
                         logger.warning(f"Step11 回测失败: {e}")
 
-                # ===== Step 12: 校准反馈 → 调整策略权重 (每25个周期) =====
-                if scan_count % 25 == 0 and _calibration:
+                # ===== Step 12: 校准反馈 → 调整策略权重 (V6: 更频繁) =====
+                cal_interval = getattr(_config, 'CALIBRATION_FEEDBACK_INTERVAL', 10)
+                if scan_count % cal_interval == 0 and _calibration:
                     try:
                         for strategy_name in list(_strategy_weights.keys()):
+                            if _strategy_weights[strategy_name] <= 0:
+                                continue  # V6: 跳过已关闭的策略
                             conf_adj = _calibration.get_confidence_adjustment(strategy_name)
-                            # 校准因子 > 1.0 表示策略可靠，增加权重
-                            # 校准因子 < 0.7 表示策略不可靠，降低权重
                             old_weight = _strategy_weights[strategy_name]
                             new_weight = old_weight * conf_adj
-                            new_weight = max(0.05, min(new_weight, 0.5))  # 权重范围 [0.05, 0.5]
+                            new_weight = max(0.1, min(new_weight, 2.0))  # V6: 权重范围 [0.1, 2.0]
                             _strategy_weights[strategy_name] = round(new_weight, 3)
                             if abs(new_weight - old_weight) > 0.01:
                                 logger.info(f"Step12 权重调整: {strategy_name} {old_weight:.3f} → {new_weight:.3f} (factor={conf_adj:.3f})")
@@ -2132,7 +2125,21 @@ def run_bot():
                             "sample_size": metrics.sample_size,
                             "confidence_adjustment": _calibration.get_confidence_adjustment(),
                         }
-                        logger.info(f"Step12 校准反馈: Brier={metrics.brier_score:.4f}, ECE={metrics.ece:.4f}, BSS={metrics.brier_skill_score:.4f}")
+                        logger.info(f"Step12 校准反馈: Brier={metrics.brier_score:.4f}, ECE={metrics.ece:.4f}, BSS={metrics.brier_skill_score:.4f}, Samples={metrics.sample_size}")
+                        
+                        # V6.0: 更新天气数据状态
+                        if _weather_fetcher:
+                            try:
+                                stats = _weather_fetcher.get_stats()
+                                bot_state["weather_state"] = {
+                                    "cities_tracked": stats["cities_supported"],
+                                    "last_fetch": stats["last_fetch"],
+                                    "markets_found": len(opportunities.get("weather", [])),
+                                    "noaa_aligned": stats["total_fetches"],
+                                    "gfs_success_rate": stats["success_rate"],
+                                }
+                            except Exception:
+                                pass
                     except Exception as e:
                         logger.warning(f"Step12 校准反馈异常: {e}")
 
