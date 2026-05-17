@@ -1,6 +1,7 @@
 """
-Polymarket 量化交易系统 V5.1 - 完整 REST API 服务器 + 专业前端仪表盘
+Polymarket 量化交易系统 V5.2 - 完整 REST API 服务器 + 专业前端仪表盘
 14步闭环数据流: WS→Scanner→SmartMoney→OrderBook→WeatherData→SignalCombiner→Kelly→Calibration→Risk→Execute→Record→Backtest→CalibrationFeedback→StrategyWeightUpdate
+V5.2修复: main()版本号、dump_hedge/counter_wallet策略处理、STRATEGY_EDGE补全
 """
 import json
 import os
@@ -13,7 +14,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 # 全局共享状态 - bot主线程写入，API线程读取
 # ============================================================
 bot_state = {
-    "version": "5.1",
+    "version": "5.2",
     "status": "starting",
     "scan_count": 0,
     "positions_count": 0,
@@ -151,7 +152,7 @@ DASHBOARD_HTML = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Polymarket V5.1 Quant Dashboard</title>
+<title>Polymarket V5.2 Quant Dashboard</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 :root{
@@ -271,8 +272,8 @@ tr:hover td{background:rgba(59,130,246,.03)}
 <!-- Header -->
 <div class="header">
   <div class="header-left">
-    <div class="logo">Polymarket V5.1</div>
-    <span class="version" id="version">v5.1</span>
+    <div class="logo">Polymarket V5.2</div>
+    <span class="version" id="version">v5.2</span>
     <div id="statusBadge" class="status-badge status-starting">
       <span class="status-dot"></span>
       <span id="statusText">Starting</span>
@@ -339,7 +340,7 @@ tr:hover td{background:rgba(59,130,246,.03)}
       </div>
     </div>
     <div class="card">
-      <div class="card-header"><span class="card-title">&#9881; V4 Modules</span></div>
+      <div class="card-header"><span class="card-title">&#9881; V5 Modules</span></div>
       <div class="card-body">
         <div class="module-grid" id="modulesGrid"></div>
       </div>
@@ -1529,9 +1530,9 @@ def run_bot():
         scan_count = 0
 
         mode = "模拟" if _config.DRY_RUN else "实盘"
-        logger.info(f"V3.5 交易系统启动 [{mode}] ${_config.INITIAL_CAPITAL} - 12步闭环数据流")
+        logger.info(f"V5.2 交易系统启动 [{mode}] ${_config.INITIAL_CAPITAL} - 14步闭环数据流")
         try:
-            _notifier.system_alert(f"V3.5 交易系统启动 [{mode}] ${_config.INITIAL_CAPITAL}")
+            _notifier.system_alert(f"V5.2 交易系统启动 [{mode}] ${_config.INITIAL_CAPITAL}")
         except Exception:
             pass
 
@@ -1743,6 +1744,9 @@ def run_bot():
                         "TIME_DECAY": 0.05,        # 时间衰减: 临近结算的确定性收益
                         "MARKET_MAKING": 0.03,     # 做市: spread捕获
                         "STAT_ARB": 0.07,          # 统计套利: 价格异常
+                        "WEATHER": 0.08,           # V5.2补全: 天气市场NOAA数据对齐
+                        "DUMP_HEDGE": 0.04,        # V5.2补全: 15min BTC对冲
+                        "COUNTER_WALLET": 0.03,    # V5.2补全: 反向跟单亏损钱包
                     }
                     base_edge = STRATEGY_EDGE.get(strategy_name, 0.05)
 
@@ -2047,6 +2051,22 @@ def run_bot():
                         except Exception as e:
                             logger.debug(f"天气市场交易处理异常: {e}")
 
+                # V5.2新增: 对冲策略 (15min BTC市场)
+                if getattr(_config, 'ENABLE_DUMP_HEDGE', True):
+                    for opp in opportunities.get("dump_hedge", []):
+                        try:
+                            process_trade_opportunity(opp, "DUMP_HEDGE", opp.get("side", "YES"), opp.get("price", 0.5))
+                        except Exception as e:
+                            logger.debug(f"对冲策略交易处理异常: {e}")
+
+                # V5.2新增: 反向跟单策略
+                if getattr(_config, 'ENABLE_COUNTER_WALLET', False):
+                    for opp in opportunities.get("counter_wallet", []):
+                        try:
+                            process_trade_opportunity(opp, "COUNTER_WALLET", opp.get("side", "YES"), opp.get("price", 0.5))
+                        except Exception as e:
+                            logger.debug(f"反向跟单交易处理异常: {e}")
+
                 # ===== Step 10: 更新全局状态 =====
                 status = _risk_manager.get_status()
                 bot_state["positions_count"] = status["positions_count"]
@@ -2177,8 +2197,8 @@ def main():
 
     print()
     print("=" * 55)
-    print("  Polymarket V3.5 量化交易系统 - REST API")
-    print("  12步闭环数据流: WS→Scanner→SM→OB→Combine→Kelly→Calib→Risk→Exec→Record→BT→CalibFB")
+    print("  Polymarket V5.2 量化交易系统 - REST API")
+    print("  14步闭环数据流: WS→Scanner→SM→OB→Weather→Combine→Kelly→Calib→Risk→Exec→Record→BT→CalibFB→WeightUpdate")
     print("=" * 55)
     print(f"  模式:     {mode}")
     print(f"  API端口:  {port}")
