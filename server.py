@@ -1,5 +1,5 @@
 """
-Polymarket 量化交易系统 V4.0 - 完整 REST API 服务器 + 专业前端仪表盘
+Polymarket 量化交易系统 V5.0 - 完整 REST API 服务器 + 专业前端仪表盘
 14步闭环数据流: WS→Scanner→SmartMoney→OrderBook→WeatherData→SignalCombiner→Kelly→Calibration→Risk→Execute→Record→Backtest→CalibrationFeedback→StrategyWeightUpdate
 """
 import json
@@ -13,7 +13,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 # 全局共享状态 - bot主线程写入，API线程读取
 # ============================================================
 bot_state = {
-    "version": "4.0",
+    "version": "5.0",
     "status": "starting",
     "scan_count": 0,
     "positions_count": 0,
@@ -61,7 +61,7 @@ bot_state = {
     "config": {},
     "data_store_stats": {},
     "strategy_performance": {},
-    # V4.0 新增状态
+    # V5.0 新增状态
     "kelly_state": {
         "last_fraction": 0.0,
         "last_raw_fraction": 0.0,
@@ -127,7 +127,7 @@ _portfolio_risk = None
 _backtester_v3 = None
 _ws_client = None
 
-# V4.0 策略权重 — 基于开源研究和学术论文(arXiv:2412.14144)调整
+# V5.0 策略权重 — 基于开源研究和学术论文(arXiv:2412.14144)调整
 # 修复: 根据学术研究调整初始权重 — 均值回归和统计套利是已验证的最有效策略
 _strategy_weights = {
     "ARBITRAGE": 0.08,         # V4降低: 41%市场存在但窗口仅2.7s，零售难以捕获(tradesignal.se)
@@ -144,14 +144,14 @@ _strategy_weights = {
 
 
 # ============================================================
-# 专业前端仪表盘 HTML (V4.0 增强版)
+# 专业前端仪表盘 HTML (V5.0 增强版)
 # ============================================================
 DASHBOARD_HTML = r"""<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Polymarket V4.0 Quant Dashboard</title>
+<title>Polymarket V5.0 Quant Dashboard</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 :root{
@@ -271,8 +271,8 @@ tr:hover td{background:rgba(59,130,246,.03)}
 <!-- Header -->
 <div class="header">
   <div class="header-left">
-    <div class="logo">Polymarket V4.0</div>
-    <span class="version" id="version">v4.0</span>
+    <div class="logo">Polymarket V5.0</div>
+    <span class="version" id="version">v5.0</span>
     <div id="statusBadge" class="status-badge status-starting">
       <span class="status-dot"></span>
       <span id="statusText">Starting</span>
@@ -346,7 +346,7 @@ tr:hover td{background:rgba(59,130,246,.03)}
     </div>
   </div>
 
-  <!-- V4.0 Advanced Metrics Row -->
+  <!-- V5.0 Advanced Metrics Row -->
   <div class="grid-4" style="margin-bottom:24px">
     <!-- Kelly & Position Sizing -->
     <div class="card">
@@ -685,7 +685,7 @@ function renderDataStore(data) {
   el.innerHTML = html;
 }
 
-// ============ V4.0 Advanced Metric Renders ============
+// ============ V5.0 Advanced Metric Renders ============
 function renderKelly(data) {
   const el = document.getElementById('kellyBody');
   if (!data || !Object.keys(data).length) { el.innerHTML = '<div class="empty-state" style="padding:20px">No Kelly data</div>'; return; }
@@ -978,7 +978,7 @@ class APIHandler(BaseHTTPRequestHandler):
                     "entry_time": p.entry_time,
                     "hold_time_hours": round((time.time() - p.entry_time) / 3600, 1),
                 }
-                # V4.0: 附加Kelly元数据
+                # V5.0: 附加Kelly元数据
                 if hasattr(p, '_signal_prob'):
                     pos_data["signal_prob"] = round(p._signal_prob, 4)
                 if hasattr(p, '_kelly_fraction'):
@@ -1134,7 +1134,7 @@ class APIHandler(BaseHTTPRequestHandler):
             "note": "Opportunities are generated in real-time by the bot loop",
         })
 
-    # ---------- V4.0 新增 API 端点 ----------
+    # ---------- V5.0 新增 API 端点 ----------
 
     def _kelly(self):
         """Kelly仓位参数和最近计算结果"""
@@ -1265,7 +1265,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 "kelly_cap": getattr(_config, 'KELLY_FRACTION', 0.25) if _config else 0.25,
             }
         stats["kelly_fraction"] = getattr(_config, 'KELLY_FRACTION', 0.25) if _config else 0.25
-        # V4.0: 附加信号合并器状态
+        # V5.0: 附加信号合并器状态
         stats["signal_combiner"] = bot_state.get("signal_combiner_state", {})
         stats["strategy_weights"] = _strategy_weights
         self._send_json(200, stats)
@@ -1425,7 +1425,7 @@ def run_bot():
             _orderbook = None
             bot_state["v3_modules"]["orderbook_analyzer"] = "error"
 
-        # ===== V4.0 六大模块初始化 =====
+        # ===== V5.0 六大模块初始化 =====
         # 模块一: Kelly Criterion仓位管理
         try:
             from kelly_criterion import kellyBinary, combinedKelly, confidenceAdjustedKelly, calculate_position_size_kelly
@@ -1438,9 +1438,9 @@ def run_bot():
             kelly_frac = getattr(_config, 'KELLY_FRACTION', 0.25)
             bot_state["v3_modules"]["kelly_sizing"] = "enabled" if kelly_frac > 0 else "disabled"
             bot_state["kelly_state"]["kelly_cap"] = kelly_frac
-            logger.info(f"V4.0 Kelly Criterion 初始化成功 (fraction={kelly_frac})")
+            logger.info(f"V5.0 Kelly Criterion 初始化成功 (fraction={kelly_frac})")
         except Exception as e:
-            logger.warning(f"V4.0 Kelly Criterion 初始化失败: {e}")
+            logger.warning(f"V5.0 Kelly Criterion 初始化失败: {e}")
             _kelly = None
             bot_state["v3_modules"]["kelly_sizing"] = "error"
 
@@ -1940,7 +1940,7 @@ def run_bot():
                             amount=shares,
                             current_price=trade_price,
                         )
-                        # V4.0: 附加Kelly元数据到Position
+                        # V5.0: 附加Kelly元数据到Position
                         pos._signal_prob = signals[0]["probability"] if signals else 0.5
                         pos._kelly_fraction = kelly_fraction
                         pos._highest_price = trade_price
