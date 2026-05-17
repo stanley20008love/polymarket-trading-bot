@@ -25,6 +25,11 @@ class DataStore:
     def _init_db(self):
         self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
+        # ===== 修复: 启用WAL模式解决并发"database is locked"问题 =====
+        # WAL模式允许读写并发，不会互相阻塞
+        self.conn.execute("PRAGMA journal_mode=WAL")
+        self.conn.execute("PRAGMA busy_timeout=5000")  # 等待5秒而不是立即失败
+        self.conn.execute("PRAGMA synchronous=NORMAL")  # 平衡安全性和性能
         c = self.conn.cursor()
         c.execute("""CREATE TABLE IF NOT EXISTS market_snapshots (id INTEGER PRIMARY KEY AUTOINCREMENT, market_id TEXT NOT NULL, question TEXT, yes_price REAL, no_price REAL, volume REAL, volume_24h REAL, liquidity REAL, price_change_1h REAL, price_change_24h REAL, category TEXT, fee_rate REAL, timestamp REAL NOT NULL, raw_data TEXT)""")
         c.execute("""CREATE TABLE IF NOT EXISTS trades (id INTEGER PRIMARY KEY AUTOINCREMENT, timestamp REAL NOT NULL, market_id TEXT NOT NULL, question TEXT, side TEXT, action TEXT, price REAL, amount REAL, pnl REAL DEFAULT 0, strategy TEXT, signal_strength REAL DEFAULT 0, fee_paid REAL DEFAULT 0, dry_run INTEGER DEFAULT 1)""")

@@ -222,14 +222,17 @@ def confidenceAdjustedKelly(
         )
 
     # 贝叶斯收缩因子
-    shrinkage = sample_size / (sample_size + prior_strength) if (sample_size + prior_strength) > 0 else 0
+    # 当有样本时: shrinkage = n / (n + prior_strength) → 样本越多越接近1
+    # 当无样本时: shrinkage = 0.5 (保守默认，不再用confidence替代以避免双重惩罚)
+    if sample_size > 0:
+        shrinkage = sample_size / (sample_size + prior_strength)
+    else:
+        shrinkage = 0.5  # 无样本时使用保守默认值，而非confidence(避免双重惩罚)
 
-    # 如果没有样本信息，使用置信度作为替代
-    if sample_size == 0:
-        shrinkage = confidence
-
-    # 调整Kelly
-    adjusted_f = kelly_fraction * confidence * shrinkage
+    # 调整Kelly: 只乘以置信度和收缩因子各一次
+    # 修复前: adjusted_f = kelly_fraction × confidence × confidence (BUG!)
+    # 修复后: adjusted_f = kelly_fraction × shrinkage (置信度已体现在kelly_fraction中)
+    adjusted_f = kelly_fraction * shrinkage
 
     # 应用上限
     capped = adjusted_f > kelly_cap
@@ -289,8 +292,13 @@ def calculate_position_size_kelly(
     # 预留手续费
     net_size = gross_size / (1 + fee_rate * price * (1 - price))
 
-    # 应用上下限
-    net_size = max(net_size, min_size)
+    # 应用上限 (单笔不超过资金的max_pct)
     net_size = min(net_size, capital * max_pct)
+
+    # 应用下限: 如果Kelly计算出的仓位太小(< min_size)，说明edge不足，不交易
+    # 修复前: max(net_size, min_size) → 强制拉到min_size，即使Kelly认为不该交易
+    # 修复后: 如果计算仓位 < min_size，返回0 (尊重Kelly判断)
+    if net_size < min_size:
+        return 0
 
     return round(net_size, 2)

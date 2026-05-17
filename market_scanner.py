@@ -446,7 +446,7 @@ class MarketScanner:
         return opportunities
 
     def find_event_driven_opportunities(self, markets: list[MarketInfo]) -> list[dict]:
-        """事件驱动 - V2修正：加手续费考量"""
+        """事件驱动 - V3修正：放宽限制，不再要求极端价格"""
         opportunities = []
         for m in markets:
             if m.volume_24h < self.config.EVENT_MIN_VOLUME_24H:
@@ -466,6 +466,8 @@ class MarketScanner:
                 reason = f"1h跌{abs(m.price_change_1h or 0)*100:.1f}% 过度反应?"
 
             if price > 0.01 and price < 0.95:
+                # V3: 根据价格变化幅度调整置信度
+                confidence = "HIGH" if price_change > 15 else ("MEDIUM" if price_change > 8 else "LOW")
                 opportunities.append({
                     "market": m,
                     "type": "EVENT_DRIVEN",
@@ -473,16 +475,157 @@ class MarketScanner:
                     "price": price,
                     "volume_24h": m.volume_24h,
                     "price_change_1h": m.price_change_1h,
+                    "price_change_pct": price_change,  # V3: 用于Kelly edge计算
                     "taker_fee_rate": m.taker_fee_rate,
-                    "confidence": "LOW",
+                    "confidence": confidence,
                     "reason": f"{reason} 手续费{m.taker_fee_rate:.0%}",
                 })
 
         opportunities.sort(key=lambda x: abs(x["price_change_1h"] or 0), reverse=True)
         return opportunities
 
+    def find_time_decay_opportunities(self, markets: list[MarketInfo]) -> list[dict]:
+        """
+        V3新增策略：时间衰减/临近结算确定性收益
+        来源: "How to Harvest $200/day on Polymarket" + 学术研究SF8(深度在结算前衰减)
+        
+        逻辑: 当市场临近结算且价格极端(>90%或<10%)时，
+        不确定性下降→价格向0或1收敛→可以捕获时间价值
+        """
+        opportunities = []
+        for m in markets:
+            # 需要足够流动性
+            if m.liquidity < 5000:
+                continue
+            if m.volume_24h < 10000:
+                continue
+
+            # 临近结算的高确定性市场
+            # YES价格>0.90: 市场认为YES很可能发生，买入YES赚取结算收益
+            if m.yes_price >= 0.90 and m.yes_price < 0.98:
+                potential_return = (1.0 - m.yes_price) / m.yes_price  # e.g. 0.92→8.7%
+                # 扣手续费后仍有正收益
+                fee = m.calc_fee(1, m.yes_price)
+                net_return = potential_return - fee / m.yes_price
+                if net_return > 0.01:  # 扣费后至少1%收益
+                    opportunities.append({
+                        "market": m,
+                        "type": "TIME_DECAY_HIGH_PROB",
+                        "side": "YES",
+                        "price": m.yes_price,
+                        "potential_return": potential_return,
+                        "net_return": net_return,
+                        "arb_spread": net_return,  # 用于Kelly edge
+                        "taker_fee_rate": m.taker_fee_rate,
+                        "confidence": "HIGH" if m.yes_price >= 0.95 else "MEDIUM",
+                        "reason": f"高确定性市场 YES={m.yes_price:.3f} 扣费净收益{net_return:.1%}",
+                    })
+
+            # NO价格>0.90 (即YES<0.10): 同理买入NO
+            elif m.yes_price <= 0.10 and m.yes_price > 0.02:
+                potential_return = (1.0 - m.no_price) / m.no_price
+                fee = m.calc_fee(1, m.no_price)
+                net_return = potential_return - fee / m.no_price
+                if net_return > 0.01:
+                    opportunities.append({
+                        "market": m,
+                        "type": "TIME_DECAY_HIGH_PROB",
+                        "side": "NO",
+                        "price": m.no_price,
+                        "potential_return": potential_return,
+                        "net_return": net_return,
+                        "arb_spread": net_return,
+                        "taker_fee_rate": m.taker_fee_rate,
+                        "confidence": "HIGH" if m.yes_price <= 0.05 else "MEDIUM",
+                        "reason": f"高确定性市场 NO={m.no_price:.3f} 扣费净收益{net_return:.1%}",
+                    })
+
+        opportunities.sort(key=lambda x: x["net_return"], reverse=True)
+        return opportunities
+
+    def find_stat_arb_opportunities(self, markets: list[MarketInfo]) -> list[dict]:
+        """
+        V3新增策略：统计套利 (SPREAD_FADE + MOMENTUM + MEAN_REVERSION)
+        来源: ResearchGate论文"Statistical Arbitrage in Binary Prediction Markets"
+        
+        1. SPREAD_FADE: 买卖价差异常大时→向中价回归
+        2. MOMENTUM: 价格有持续性→跟随方向
+        3. 短期均值回归: 1小时价格变化过大→反转
+        """
+        opportunities = []
+        for m in markets:
+            if m.liquidity < 5000:
+                continue
+            if m.volume_24h < 10000:
+                continue
+
+            # 策略1: SPREAD_FADE — 买卖价差异常大
+            if m.best_bid > 0 and m.best_ask > 0:
+                mid_price = (m.best_bid + m.best_ask) / 2
+                spread_pct = (m.best_ask - m.best_bid) / mid_price if mid_price > 0 else 0
+                
+                # 价差>5%属于异常宽 (正常1-3%)
+                if spread_pct > 0.05 and m.yes_price > 0.15 and m.yes_price < 0.85:
+                    # 如果YES价格偏低+宽价差→买入YES(fade toward mid)
+                    if m.yes_price < mid_price:
+                        opportunities.append({
+                            "market": m,
+                            "type": "SPREAD_FADE",
+                            "side": "YES",
+                            "price": m.yes_price,
+                            "spread_pct": spread_pct,
+                            "arb_spread": spread_pct * 0.3,  # 预期收敛30%的价差
+                            "taker_fee_rate": m.taker_fee_rate,
+                            "confidence": "MEDIUM",
+                            "reason": f"宽价差{spread_pct:.1%} fade→YES mid={mid_price:.3f}",
+                        })
+                    else:
+                        opportunities.append({
+                            "market": m,
+                            "type": "SPREAD_FADE",
+                            "side": "NO",
+                            "price": m.no_price,
+                            "spread_pct": spread_pct,
+                            "arb_spread": spread_pct * 0.3,
+                            "taker_fee_rate": m.taker_fee_rate,
+                            "confidence": "MEDIUM",
+                            "reason": f"宽价差{spread_pct:.1%} fade→NO mid={1-mid_price:.3f}",
+                        })
+
+            # 策略2: MOMENTUM — 跟随24h趋势 (有信息量的方向)
+            if m.price_change_24h and abs(m.price_change_24h) > 0.03:
+                if m.price_change_24h > 0 and m.yes_price < 0.80:
+                    # 24h上涨3%+ → 跟随做多YES
+                    opportunities.append({
+                        "market": m,
+                        "type": "MOMENTUM",
+                        "side": "YES",
+                        "price": m.yes_price,
+                        "momentum": m.price_change_24h,
+                        "arb_spread": abs(m.price_change_24h) * 0.5,
+                        "taker_fee_rate": m.taker_fee_rate,
+                        "confidence": "LOW",
+                        "reason": f"24h动量+{m.price_change_24h*100:.1f}% 跟随YES",
+                    })
+                elif m.price_change_24h < 0 and m.no_price < 0.80:
+                    # 24h下跌3%+ → 跟随做多NO
+                    opportunities.append({
+                        "market": m,
+                        "type": "MOMENTUM",
+                        "side": "NO",
+                        "price": m.no_price,
+                        "momentum": m.price_change_24h,
+                        "arb_spread": abs(m.price_change_24h) * 0.5,
+                        "taker_fee_rate": m.taker_fee_rate,
+                        "confidence": "LOW",
+                        "reason": f"24h动量{m.price_change_24h*100:.1f}% 跟随NO",
+                    })
+
+        opportunities.sort(key=lambda x: x.get("arb_spread", 0), reverse=True)
+        return opportunities
+
     def scan_all(self) -> dict[str, list[dict]]:
-        """执行全部V2扫描"""
+        """执行全部V3扫描"""
         markets = self.fetch_active_markets()
 
         results = {
@@ -492,6 +635,8 @@ class MarketScanner:
             "zero_fee": [],
             "mean_reversion": [],
             "event_driven": [],
+            "time_decay": [],      # V3新增
+            "stat_arb": [],        # V3新增
         }
 
         if self.config.ENABLE_ARBITRAGE:
@@ -513,5 +658,12 @@ class MarketScanner:
         if self.config.ENABLE_EVENT_DRIVEN:
             results["event_driven"] = self.find_event_driven_opportunities(markets)
             logger.info(f"事件驱动: {len(results['event_driven'])}个")
+
+        # V3新增策略
+        results["time_decay"] = self.find_time_decay_opportunities(markets)
+        logger.info(f"时间衰减: {len(results['time_decay'])}个")
+
+        results["stat_arb"] = self.find_stat_arb_opportunities(markets)
+        logger.info(f"统计套利: {len(results['stat_arb'])}个")
 
         return results

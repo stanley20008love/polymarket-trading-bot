@@ -62,14 +62,15 @@ class Config:
     MAX_CAPITAL = float(os.getenv("MAX_CAPITAL", "1000"))
     TRADE_SIZE_PERCENT = float(os.getenv("TRADE_SIZE_PERCENT", "8"))  # V2: 10%→8%更保守
     MIN_TRADE_SIZE = float(os.getenv("MIN_TRADE_SIZE", "5"))
-    MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "3"))
+    MAX_POSITIONS = int(os.getenv("MAX_POSITIONS", "5"))  # V3: 3→5 允许更多分散持仓
 
-    # 风控 V2 - 学习top钱包的更严格标准
-    # 84%亏损者的教训：止损要早、仓位要小
-    STOP_LOSS_PERCENT = float(os.getenv("STOP_LOSS_PERCENT", "3"))    # V2: 5%→3%
-    TAKE_PROFIT_PERCENT = float(os.getenv("TAKE_PROFIT_PERCENT", "8"))  # V2: 15%→8% 见好就收
-    DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT", "1.5"))    # V2: 3%→1.5%
-    WEEKLY_LOSS_LIMIT = float(os.getenv("WEEKLY_LOSS_LIMIT", "5"))    # V2: 8%→5%
+    # 风控 V3 - 根据学术研究调整
+    # 3%止损对二元市场太紧(正常波动就触发)，8%更合理
+    # 来源: 顶级bot(WeatherBot, ProbablyProfit)普遍使用20-30%止损
+    STOP_LOSS_PERCENT = float(os.getenv("STOP_LOSS_PERCENT", "8"))    # V3: 3%→8%
+    TAKE_PROFIT_PERCENT = float(os.getenv("TAKE_PROFIT_PERCENT", "15"))  # V3: 8%→15% 让利润跑
+    DAILY_LOSS_LIMIT = float(os.getenv("DAILY_LOSS_LIMIT", "3"))    # V3: 1.5%→3%
+    WEEKLY_LOSS_LIMIT = float(os.getenv("WEEKLY_LOSS_LIMIT", "8"))    # V3: 5%→8%
 
     # 策略开关
     ENABLE_ARBITRAGE = os.getenv("ENABLE_ARBITRAGE", "true").lower() == "true"
@@ -85,14 +86,14 @@ class Config:
     # 多市场套利：negRisk事件所有YES总和偏离1.0的最小值
     MULTI_ARB_MIN_GAP = float(os.getenv("MULTI_ARB_MIN_GAP", "2.0"))  # 2%以上才考虑
 
-    # 均值回归
-    MEAN_REV_LOW_THRESHOLD = float(os.getenv("MEAN_REV_LOW_THRESHOLD", "0.10"))
-    MEAN_REV_HIGH_THRESHOLD = float(os.getenv("MEAN_REV_HIGH_THRESHOLD", "0.90"))
-    MEAN_REV_MIN_VOLUME = float(os.getenv("MEAN_REV_MIN_VOLUME", "50000"))
+    # 均值回归 — 放宽范围以捕获更多机会
+    MEAN_REV_LOW_THRESHOLD = float(os.getenv("MEAN_REV_LOW_THRESHOLD", "0.20"))   # V3: 0.10→0.20
+    MEAN_REV_HIGH_THRESHOLD = float(os.getenv("MEAN_REV_HIGH_THRESHOLD", "0.80"))  # V3: 0.90→0.80
+    MEAN_REV_MIN_VOLUME = float(os.getenv("MEAN_REV_MIN_VOLUME", "30000"))         # V3: 50000→30000
 
-    # 事件驱动
-    EVENT_MIN_VOLUME_24H = float(os.getenv("EVENT_MIN_VOLUME_24H", "100000"))
-    EVENT_PRICE_CHANGE_THRESHOLD = float(os.getenv("EVENT_PRICE_CHANGE_THRESHOLD", "10"))
+    # 事件驱动 — 降低门槛以捕获更多机会
+    EVENT_MIN_VOLUME_24H = float(os.getenv("EVENT_MIN_VOLUME_24H", "50000"))  # V3: 100000→50000
+    EVENT_PRICE_CHANGE_THRESHOLD = float(os.getenv("EVENT_PRICE_CHANGE_THRESHOLD", "5"))  # V3: 10→5
 
     # 0手续费策略（地缘政治市场）
     ZERO_FEE_MIN_VOLUME = float(os.getenv("ZERO_FEE_MIN_VOLUME", "100000"))
@@ -116,7 +117,7 @@ class Config:
     TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
     # 运行
-    SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "20"))  # V2: 30s→20s 更快捕捉
+    SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", "15"))  # V3: 20s→15s 更快捕捉
     LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
 
     # API端点

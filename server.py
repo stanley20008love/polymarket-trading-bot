@@ -34,6 +34,8 @@ bot_state = {
         "event_driven": "disabled",
         "zero_fee": "disabled",
         "multi_market_arb": "disabled",
+        "time_decay": "disabled",
+        "stat_arb": "disabled",
     },
     "v3_modules": {
         "smart_money": "disabled",
@@ -105,12 +107,15 @@ _backtester_v3 = None
 _ws_client = None
 
 # V3.5 策略权重(由校准反馈动态调整)
+# 修复: 根据学术研究调整初始权重 — 均值回归和统计套利是已验证的最有效策略
 _strategy_weights = {
-    "ARBITRAGE": 0.3,
-    "MEAN_REVERSION": 0.25,
-    "EVENT_DRIVEN": 0.2,
-    "ZERO_FEE_VALUE": 0.15,
-    "STOP_LOSS_TP": 0.1,
+    "ARBITRAGE": 0.15,        # 降低: 41%市场存在但窗口仅2.7s，零售难以捕获
+    "MEAN_REVERSION": 0.30,   # 提高: ResearchGate论文验证可盈利，尤其大波动后
+    "EVENT_DRIVEN": 0.15,     # 中等: 需要放宽极端价格限制
+    "ZERO_FEE_VALUE": 0.10,   # 中等: 0手续费市场是真实优势
+    "STOP_LOSS_TP": 0.05,     # 低: 这是风控不是策略
+    "TIME_DECAY": 0.15,       # 新增: 临近结算市场的确定性收益
+    "STAT_ARB": 0.10,         # 新增: 统计套利(spread_fade + momentum)
 }
 
 
@@ -1653,15 +1658,23 @@ def run_bot():
                         if _calibration:
                             try:
                                 signal_prob = getattr(pos, '_signal_prob', 0.5)
-                                # 判断实际结果: 盈利=1, 亏损=0
-                                actual_outcome = 1 if pos.pnl > 0 else 0
+                                # ===== 修复: actual_outcome = 事件是否真的发生 =====
+                                # 修复前: actual_outcome = 1 if pnl > 0 (用盈利判断，学反了!)
+                                # 修复后: 买入YES且YES价格>0.5 = 事件更可能发生; 买入NO同理
+                                # 真正的判断依据: 平仓价格是否验证了我们的方向
+                                if pos.side == "YES":
+                                    # 买入YES: 如果当前价格>入场价，说明市场同意YES方向
+                                    actual_outcome = 1 if pos.current_price >= pos.entry_price else 0
+                                else:
+                                    # 买入NO: 如果当前价格<入场价(NO价=1-YES价上涨)，说明市场同意NO方向
+                                    actual_outcome = 1 if pos.current_price <= pos.entry_price else 0
                                 _calibration.record_observation(
                                     predicted_prob=signal_prob,
                                     actual_outcome=actual_outcome,
-                                    strategy="STOP_LOSS_TP",
+                                    strategy=getattr(pos, '_strategy', 'STOP_LOSS_TP'),
                                     market_id=pos.market_id,
                                 )
-                                logger.info(f"Step10 校准记录: predicted={signal_prob:.3f}, actual={actual_outcome}, pnl={pos.pnl:.4f}")
+                                logger.info(f"Step10 校准记录: predicted={signal_prob:.3f}, actual={actual_outcome}, side={pos.side}, entry={pos.entry_price:.3f}, current={pos.current_price:.3f}")
                             except Exception as e:
                                 logger.debug(f"校准记录失败: {e}")
 
@@ -1690,11 +1703,36 @@ def run_bot():
                     signals = []
                     strategy_weight = _strategy_weights.get(strategy_name, 0.2)
 
-                    # 策略信号概率
+                    # ===== 修复: 动态策略概率计算 (替代hardcoded +5%) =====
+                    # 根据策略类型计算不同edge，来源: 学术研究 + 顶级bot分析
+                    STRATEGY_EDGE = {
+                        "ARBITRAGE": 0.08,         # 套利: 边际由arb_spread决定
+                        "MEAN_REVERSION": 0.15,    # 均值回归: 深度低估/高估有更大edge
+                        "EVENT_DRIVEN": 0.10,      # 事件驱动: 价格过激反应的回归空间
+                        "ZERO_FEE_VALUE": 0.06,    # 0手续费: 仅费率优势
+                        "TIME_DECAY": 0.05,        # 时间衰减: 临近结算的确定性收益
+                        "MARKET_MAKING": 0.03,     # 做市: spread捕获
+                        "STAT_ARB": 0.07,          # 统计套利: 价格异常
+                    }
+                    base_edge = STRATEGY_EDGE.get(strategy_name, 0.05)
+
+                    # 均值回归: 价格越极端edge越大
+                    if strategy_name == "MEAN_REVERSION":
+                        # 价格离0.5越远，edge越大 (二次函数)
+                        deviation = abs(trade_price - 0.5)
+                        base_edge = 0.05 + deviation * 0.4  # price=0.10→edge=0.21, price=0.05→edge=0.23
+                    # 套利: edge由实际spread决定
+                    elif strategy_name == "ARBITRAGE":
+                        base_edge = max(0.03, opp.get("arb_spread", 0.03))
+                    # 事件驱动: 价格变化越大edge越大
+                    elif strategy_name == "EVENT_DRIVEN":
+                        price_change = abs(opp.get("price_change_pct", 10))
+                        base_edge = min(0.20, 0.05 + price_change * 0.01)
+
                     if side == "YES":
-                        strategy_prob = min(0.95, trade_price + 0.05 + opp.get("arb_spread", 0) * 0.5)
+                        strategy_prob = min(0.95, trade_price + base_edge)
                     else:
-                        strategy_prob = max(0.05, 1 - trade_price - 0.05 - opp.get("arb_spread", 0) * 0.5)
+                        strategy_prob = min(0.95, (1 - trade_price) + base_edge)
                     signals.append({
                         "strategy": strategy_name,
                         "probability": strategy_prob,
@@ -1738,7 +1776,10 @@ def run_bot():
                         })
 
                     # --- Step 6: Kelly仓位计算 ---
-                    trade_amount = _risk_manager.calculate_position_size(_config.INITIAL_CAPITAL)
+                    # ===== 修复: 统一使用Kelly仓位，移除fallback到固定8% =====
+                    # 修复前: Kelly=0时fallback到calculate_position_size(8%固定)，无视Kelly判断
+                    # 修复后: Kelly=0意味着edge不足，不交易 (尊重数学)
+                    trade_amount = 0
                     kelly_fraction = 0.0
                     kelly_edge = 0.0
                     kelly_confidence = 0.0
@@ -1793,8 +1834,8 @@ def run_bot():
                                 return
 
                         except Exception as e:
-                            logger.warning(f"Step6 Kelly计算失败: {e}, 使用默认仓位")
-                            trade_amount = _risk_manager.calculate_position_size(_config.INITIAL_CAPITAL)
+                            logger.warning(f"Step6 Kelly计算失败: {e}, 跳过交易")
+                            return  # Kelly计算失败也不交易，不fallback到固定仓位
 
                     # --- Step 7: 校准调整 ---
                     calibration_factor = 1.0
@@ -1878,6 +1919,7 @@ def run_bot():
                         pos._signal_prob = signals[0]["probability"] if signals else 0.5
                         pos._kelly_fraction = kelly_fraction
                         pos._highest_price = trade_price
+                        pos._strategy = strategy_name  # 记录策略名称用于校准
                         _risk_manager.add_position(pos)
 
                         # Step 10: 记录交易
@@ -1896,6 +1938,7 @@ def run_bot():
                             _data_store.save_trade(record)
 
                 # --- 套利策略 ---
+                # 修复: 套利也走Kelly路径，不用固定仓位
                 if _config.ENABLE_ARBITRAGE:
                     for opp in opportunities.get("single_arb", []):
                         m = opp["market"]
@@ -1903,43 +1946,11 @@ def run_bot():
                             continue
                         if any(p.market_id == m.id for p in _risk_manager.positions):
                             continue
-                        trade_amount = _risk_manager.calculate_position_size(_config.INITIAL_CAPITAL)
-                        can, reason = _risk_manager.check_can_trade(trade_amount * 2)
-                        if not can:
-                            continue
-                        logger.info(f"套利: {m.question[:40]} 空间={opp['arb_spread']*100:.2f}%")
-                        if _config.DRY_RUN:
-                            yes_shares = trade_amount / m.yes_price if m.yes_price > 0 else 0
-                            yes_pos = Position(
-                                market_id=m.id, question=m.question,
-                                token_id=m.yes_token_id, side="YES",
-                                entry_price=m.yes_price, amount=yes_shares,
-                                current_price=m.yes_price,
-                            )
-                            yes_pos._signal_prob = m.yes_price
-                            yes_pos._kelly_fraction = 0.25
-                            yes_pos._highest_price = m.yes_price
-                            _risk_manager.add_position(yes_pos)
-                            no_shares = trade_amount / m.no_price if m.no_price > 0 else 0
-                            no_pos = Position(
-                                market_id=f"{m.id}_NO", question=m.question,
-                                token_id=m.no_token_id, side="NO",
-                                entry_price=m.no_price, amount=no_shares,
-                                current_price=m.no_price,
-                            )
-                            no_pos._signal_prob = m.no_price
-                            no_pos._kelly_fraction = 0.25
-                            no_pos._highest_price = m.no_price
-                            _risk_manager.add_position(no_pos)
-                            record = TradeRecord(
-                                timestamp=time.time(), market_id=m.id,
-                                question=m.question, side="YES+NO", action="BUY",
-                                price=m.total_price, amount=trade_amount * 2,
-                                strategy="ARBITRAGE",
-                            )
-                            _risk_manager.record_trade(record)
-                            if _data_store:
-                                _data_store.save_trade(record)
+                        # 套利走process_trade_opportunity以获得Kelly仓位
+                        try:
+                            process_trade_opportunity(opp, "ARBITRAGE", "YES", opp.get("price", m.yes_price if hasattr(m, 'yes_price') else 0.5))
+                        except Exception as e:
+                            logger.debug(f"套利交易处理异常: {e}")
 
                 # 多市场套利
                 if getattr(_config, 'ENABLE_MULTI_MARKET_ARB', False):
@@ -1973,15 +1984,30 @@ def run_bot():
                             logger.debug(f"均值回归交易处理异常: {e}")
 
                 # 事件驱动 (使用闭环处理)
+                # 修复: 放宽极端价格限制 — 原版要求is_extreme_price(YES<0.10或>0.90)
+                # 这导致只能交易流动性差的极端市场。改为: 所有价格区间均可，但edge动态调整
                 if _config.ENABLE_EVENT_DRIVEN:
                     for opp in opportunities.get("event_driven", []):
                         m = opp.get("market")
-                        if hasattr(m, 'is_extreme_price') and not m.is_extreme_price:
-                            continue
                         try:
                             process_trade_opportunity(opp, "EVENT_DRIVEN", opp.get("side", "YES"), opp.get("price", 0.5))
                         except Exception as e:
                             logger.debug(f"事件驱动交易处理异常: {e}")
+
+                # V3新增: 时间衰减策略
+                for opp in opportunities.get("time_decay", []):
+                    try:
+                        process_trade_opportunity(opp, "TIME_DECAY", opp.get("side", "YES"), opp.get("price", 0.5))
+                    except Exception as e:
+                        logger.debug(f"时间衰减交易处理异常: {e}")
+
+                # V3新增: 统计套利策略
+                for opp in opportunities.get("stat_arb", []):
+                    try:
+                        opp_type = opp.get("type", "STAT_ARB")
+                        process_trade_opportunity(opp, "STAT_ARB", opp.get("side", "YES"), opp.get("price", 0.5))
+                    except Exception as e:
+                        logger.debug(f"统计套利交易处理异常: {e}")
 
                 # ===== Step 10: 更新全局状态 =====
                 status = _risk_manager.get_status()

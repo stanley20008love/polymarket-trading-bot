@@ -51,8 +51,8 @@ class DynamicStopLoss:
         self.max_hold_hours = 72
         self.trail_trigger_pct = 5.0
         self.trail_distance_pct = 2.0
-        self.fixed_stop_pct = 3.0  # 退化的固定止损%
-        self.take_profit_pct = 8.0
+        self.fixed_stop_pct = 8.0  # V3: 3%→8% 与config.py同步
+        self.take_profit_pct = 15.0  # V3: 8%→15% 让利润跑
 
         if config:
             self.atr_multiplier = getattr(config, 'ATR_MULTIPLIER', 1.5)
