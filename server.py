@@ -13,7 +13,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 # 全局共享状态 - bot主线程写入，API线程读取
 # ============================================================
 bot_state = {
-    "version": "3.2",
+    "version": "3.5",
     "status": "starting",
     "scan_count": 0,
     "positions_count": 0,
@@ -64,6 +64,13 @@ _data_store = None
 _executor = None
 _scanner = None
 _config = None
+_kelly = None
+_orderbook_engine = None
+_calibration = None
+_dynamic_stop = None
+_portfolio_risk = None
+_backtester_v3 = None
+_ws_client = None
 
 
 # ============================================================
@@ -705,6 +712,9 @@ class APIHandler(BaseHTTPRequestHandler):
             "/api/strategy-performance": self._strategy_performance,
             "/api/opportunities": self._opportunities,
             "/api/dashboard": self._dashboard_summary,
+            "/api/calibration": self._calibration,
+            "/api/backtest": self._backtest,
+            "/api/v3-modules-stats": self._v3_modules_stats,
         }
         handler = routes.get(path)
         if handler:
@@ -913,6 +923,53 @@ class APIHandler(BaseHTTPRequestHandler):
             "note": "Opportunities are generated in real-time by the bot loop",
         })
 
+    def _calibration(self):
+        """概率校准数据"""
+        if _calibration:
+            stats = _calibration.get_stats()
+            metrics = _calibration.get_metrics()
+            return self._send_json(200, {
+                "stats": stats,
+                "overall_metrics": {
+                    "brier_score": metrics.brier_score,
+                    "ece": metrics.ece,
+                    "brier_skill_score": metrics.brier_skill_score,
+                    "reliability": metrics.reliability,
+                    "sample_size": metrics.sample_size,
+                },
+                "confidence_adjustment": _calibration.get_confidence_adjustment(),
+            })
+        self._send_json(200, {"stats": {}, "overall_metrics": {}, "confidence_adjustment": 1.0})
+
+    def _backtest(self):
+        """回测数据"""
+        if _backtester_v3 and _data_store:
+            try:
+                results = _backtester_v3.compare_strategies(
+                    capital=_config.INITIAL_CAPITAL if _config else 100,
+                    days=30
+                )
+                return self._send_json(200, {"results": results})
+            except Exception as e:
+                return self._send_json(200, {"results": {}, "error": str(e)})
+        self._send_json(200, {"results": {}})
+
+    def _v3_modules_stats(self):
+        """V3.5模块统计"""
+        stats = {}
+        if _dynamic_stop:
+            stats["dynamic_stop_loss"] = _dynamic_stop.get_stats()
+        if _portfolio_risk:
+            stats["portfolio_risk"] = _portfolio_risk.get_stats()
+        if _orderbook_engine:
+            stats["orderbook_engine"] = _orderbook_engine.get_stats()
+        if _ws_client:
+            stats["websocket_client"] = _ws_client.get_status()
+        if _calibration:
+            stats["calibration"] = _calibration.get_stats()
+        stats["kelly_fraction"] = getattr(_config, 'KELLY_FRACTION', 0.25) if _config else 0.25
+        self._send_json(200, stats)
+
     def _dashboard_summary(self):
         """聚合所有仪表盘需要的数据到一个端点，减少前端请求次数"""
         self._send_json(200, {
@@ -984,6 +1041,7 @@ def start_api_server(port=8000):
 def run_bot():
     """在后台线程中运行交易机器人"""
     global _risk_manager, _smart_money, _orderbook, _data_store, _executor, _scanner, _config
+    global _kelly, _orderbook_engine, _calibration, _dynamic_stop, _portfolio_risk, _backtester_v3, _ws_client
 
     import logging
     import sys
@@ -1009,13 +1067,6 @@ def run_bot():
         bot_state["strategies"]["event_driven"] = "enabled" if _config.ENABLE_EVENT_DRIVEN else "disabled"
         bot_state["strategies"]["zero_fee"] = "enabled" if getattr(_config, 'ENABLE_ZERO_FEE', False) else "disabled"
         bot_state["strategies"]["multi_market_arb"] = "enabled" if getattr(_config, 'ENABLE_MULTI_MARKET_ARB', False) else "disabled"
-        bot_state["v3_modules"]["smart_money"] = "enabled" if getattr(_config, 'ENABLE_SMART_MONEY', False) else "disabled"
-        bot_state["v3_modules"]["kelly_sizing"] = "enabled" if getattr(_config, 'KELLY_FRACTION', 0) > 0 else "disabled"
-        bot_state["v3_modules"]["websocket"] = "enabled" if getattr(_config, 'WS_ENABLED', False) else "disabled"
-        bot_state["v3_modules"]["backtester"] = "enabled" if _data_store else "disabled"
-        bot_state["v3_modules"]["probability_calibration"] = "enabled" if _data_store else "disabled"
-        bot_state["v3_modules"]["dynamic_stop_loss"] = "enabled"
-        bot_state["v3_modules"]["portfolio_risk"] = "enabled"
 
         # 初始化核心模块
         _scanner = MarketScanner(_config)
@@ -1053,6 +1104,79 @@ def run_bot():
             logger.warning(f"V3 OrderbookAnalyzer 初始化失败: {e}")
             _orderbook = None
             bot_state["v3_modules"]["orderbook_analyzer"] = f"error"
+
+        # ===== V3.5 五大模块初始化 =====
+        # 模块一: Kelly Criterion仓位管理
+        try:
+            from kelly_criterion import kellyBinary, combinedKelly, confidenceAdjustedKelly, calculate_position_size_kelly
+            _kelly = {
+                "kellyBinary": kellyBinary,
+                "combinedKelly": combinedKelly,
+                "confidenceAdjustedKelly": confidenceAdjustedKelly,
+                "calculate_position_size_kelly": calculate_position_size_kelly,
+            }
+            kelly_frac = getattr(_config, 'KELLY_FRACTION', 0.25)
+            bot_state["v3_modules"]["kelly_sizing"] = "enabled" if kelly_frac > 0 else "disabled"
+            logger.info(f"V3.5 Kelly Criterion 初始化成功 (fraction={kelly_frac})")
+        except Exception as e:
+            logger.warning(f"V3.5 Kelly Criterion 初始化失败: {e}")
+            _kelly = None
+            bot_state["v3_modules"]["kelly_sizing"] = "error"
+
+        # 模块二: WebSocket + OrderbookEngine
+        try:
+            from orderbook_engine import ResilientWebSocket, OrderbookEngine
+            _orderbook_engine = OrderbookEngine(max_snapshots=100, stale_seconds=60)
+            ws_enabled = getattr(_config, 'WS_ENABLED', False)
+            if ws_enabled:
+                _ws_client = ResilientWebSocket(_config)
+                _ws_client.on("orderbook_update", lambda d: _orderbook_engine.update_book(
+                    d.get("token_id", ""), d.get("bids", []), d.get("asks", [])))
+                _ws_client.start()
+            bot_state["v3_modules"]["websocket"] = "enabled" if ws_enabled else "disabled"
+            logger.info(f"V3.5 OrderbookEngine 初始化成功 (WS={'ON' if ws_enabled else 'OFF'})")
+        except Exception as e:
+            logger.warning(f"V3.5 OrderbookEngine 初始化失败: {e}")
+            _orderbook_engine = None
+            _ws_client = None
+            bot_state["v3_modules"]["websocket"] = "error"
+
+        # 模块三: 事件驱动回测引擎
+        try:
+            from backtester import BacktestEngine
+            _backtester_v3 = BacktestEngine(_config, _data_store)
+            bot_state["v3_modules"]["backtester"] = "enabled" if _data_store else "disabled"
+            logger.info("V3.5 BacktestEngine 初始化成功")
+        except Exception as e:
+            logger.warning(f"V3.5 BacktestEngine 初始化失败: {e}")
+            _backtester_v3 = None
+            bot_state["v3_modules"]["backtester"] = "error"
+
+        # 模块四: 概率校准引擎
+        try:
+            from probability_calibration import ProbabilityCalibration
+            _calibration = ProbabilityCalibration()
+            bot_state["v3_modules"]["probability_calibration"] = "enabled"
+            logger.info("V3.5 ProbabilityCalibration 初始化成功")
+        except Exception as e:
+            logger.warning(f"V3.5 ProbabilityCalibration 初始化失败: {e}")
+            _calibration = None
+            bot_state["v3_modules"]["probability_calibration"] = "error"
+
+        # 模块五: 动态止损 + 组合风险管理
+        try:
+            from risk_manager_v3 import DynamicStopLoss, PortfolioRiskManager
+            _dynamic_stop = DynamicStopLoss(_config)
+            _portfolio_risk = PortfolioRiskManager(_config.INITIAL_CAPITAL)
+            bot_state["v3_modules"]["dynamic_stop_loss"] = "enabled"
+            bot_state["v3_modules"]["portfolio_risk"] = "enabled"
+            logger.info("V3.5 DynamicStopLoss + PortfolioRiskManager 初始化成功")
+        except Exception as e:
+            logger.warning(f"V3.5 风险管理模块初始化失败: {e}")
+            _dynamic_stop = None
+            _portfolio_risk = None
+            bot_state["v3_modules"]["dynamic_stop_loss"] = "error"
+            bot_state["v3_modules"]["portfolio_risk"] = "error"
 
         # 加载状态
         state_file = os.path.join(os.path.dirname(__file__), "bot_state.json")
